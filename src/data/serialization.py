@@ -27,7 +27,7 @@ def save_papers_to_json(papers: list[Paper], output_dir: Optional[str | Path] = 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for paper in papers:
-        filename = paper.title.replace(" ", "_").replace("/", "_") + ".json"
+        filename = paper.id + ".json"
         filepath = output_dir / filename
 
         try:
@@ -71,9 +71,11 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> list[Paper]:
             paper = Paper(
                 source_file=data["source_file"],
                 text=data["text"],
+                id=data["id"],
                 title=data.get("title"),
                 authors=data.get("authors"),
                 year=data.get("year"),
+                publication=data.get("publication"),
             )
             papers.append(paper)
             logger.info(f"Loaded: {json_file.name}")

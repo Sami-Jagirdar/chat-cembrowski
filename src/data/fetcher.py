@@ -51,14 +51,13 @@ def _get_author_articles(
         "author_id": author_id,
     })
     articles = results.get("articles", [])
-    # articles = results["articles"]
     logger.info(f"Retrieved {len(articles)} articles for author {author_id}")
-    return articles
+    return articles[:num_articles]
 
 def _find_public_resource(
         article_title: str,
         api_key: str,
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """ 
     Searches for a specific paper using Google Scholar API and looks for a publicly available PDF or HTML link.
     Args:
@@ -78,20 +77,22 @@ def _find_public_resource(
     organic_results = results.get("organic_results", [])
     if not organic_results:
         logger.debug(f"No search results found for article: {article_title}")
-        return None
+        return (None, None)
     
     article = organic_results[0]
     resources: list[dict] = article.get("resources", [])
+    result_id = article.get("result_id", "")
     for resource in resources:
         file_format: str = resource.get("file_format", "").lower()
         link: str = resource.get("link", "")
+        
 
         if file_format in ["pdf", "html"] and link:
             logger.info(f"Found public resource for article '{article_title}': {link} ({file_format})")
-            return link
+            return link, result_id
         
     logger.debug(f"No public resources found for article: {article_title}")
-    return None
+    return (None, None)
 
 def _download_file(url: str, dest_path: Path) -> bool:
     """
@@ -113,7 +114,9 @@ def _download_file(url: str, dest_path: Path) -> bool:
         logger.info("Saved: %s (%.1f MB)", dest_path.name, dest_path.stat().st_size / (1024 * 1024))
         return True
     except requests.RequestException as e:
-        logger.error(f"Failed to download {url}: {e}")
+        logger.warning(f"Error downloading file")
+        if e.response.status_code == 403:
+            logger.warning(f"Access forbidden for chosen URL")
         if dest_path.exists():
             dest_path.unlink()  # Remove incomplete file
         return False
@@ -148,7 +151,7 @@ def fetch_author_papers(
     author_id: str = DEFAULT_AUTHOR_ID,
     api_key: str = SERPAPI_KEY,
     data_dir: Path = DATA_DIR,
-    num_articles: int = 10,
+    num_articles: int = 25,
 ) -> list[Paper]:
     """
     Main function to fetch papers for a given author.
@@ -190,36 +193,38 @@ def fetch_author_papers(
         except (TypeError, ValueError):
             year = None
 
+        # Parse Publication
+        publication: Optional[str] = article.get("publication", "").strip() or None
+
         # Check if paper is publicly available and get download link
-        resource_url = _find_public_resource(title, api_key)
+        resource_url, result_id = _find_public_resource(title, api_key)
         if not resource_url:
             logger.info(f"No public resource found for article '{title}', skipping.")
             continue
 
         # Download the paper
         ext = "html" if resource_url.lower().endswith(".html") else "pdf"
-        filename = title.replace(" ", "-").replace("/", "_") + f".{ext}"
+        filename = result_id + f".{ext}"
         dest_path = data_dir / filename
-        text = ""
 
         success = _download_file(resource_url, dest_path)
         if not success:
-            logger.error(f"Failed to download paper '{title}' from {resource_url}, skipping.")
+            logger.error(f"Failed to download paper '{title}'.")
+            logger.info(f"Please manually download the article at url: {resource_url}. Rename it to {filename} and save it in {data_dir} to include it in the dataset.")
+            input("Press Enter to continue")
             
-        # Parse downloaded file for text
-        if success:
-            text = _parse_pdf_for_text(dest_path) if ext == "pdf" else "" #TODO: add HTML parsing if needed
-
         # Create Paper object
         paper = Paper(
-            source_file=str(dest_path),
-            text=text,
+            id=result_id,
+            source_file=filename,
+            text="",  # Placeholder, will be filled after parsing
             title=title,
             authors=authors,
             year=year,
+            publication=publication,
         )
         papers.append(paper)
-        logger.info(f"Added paper: {title} ({len(text)} characters)")
+        logger.info(f"Added paper: {title}")
 
         time.sleep(REQUEST_DELAY)
 
