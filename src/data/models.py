@@ -25,3 +25,17 @@ class Paper:
             "processed": self.processed,
             "text": self.text,
         }
+    
+@dataclass
+class Chunk:
+    """Represents a chunk of text from a paper, along with metadata for RAG."""
+    id: str
+    text: str
+    payload: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "payload": self.payload,
+    }

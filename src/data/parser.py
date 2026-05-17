@@ -1,3 +1,7 @@
+"""
+This module provides functions to parse PDF files, extract text as markdown, clean it for RAG chunking, and store it in corresponding JSON files. It uses the pymupdf4llm library for PDF parsing and includes error handling and logging for robustness.
+"""
+
 import re
 import pymupdf4llm
 from pathlib import Path

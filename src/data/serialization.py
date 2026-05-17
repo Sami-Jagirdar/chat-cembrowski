@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .models import Paper
+from models import Paper
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,35 @@ def save_papers_to_json(papers: list[Paper], output_dir: Optional[str | Path] = 
 
     logger.info(f"Saved {len(papers)} papers to {output_dir}")
     return output_dir
+
+def load_paper(json_file: str | Path) -> Optional[Paper]:
+    """
+    Load a single Paper object from a JSON file.
+
+    Args:
+        json_file: Path to the JSON file
+    Returns:
+        Paper object or None if loading fails
+    """
+    try:
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        paper = Paper(
+            source_file=data["source_file"],
+            id=data["id"],
+            title=data.get("title"),
+            authors=data.get("authors"),
+            year=data.get("year"),
+            publication=data.get("publication"),
+            processed=data.get("processed", False),
+            text=data.get("text", ""),
+        )
+        logger.info(f"Loaded: {json_file.name}")
+        return paper
+    except Exception as e:
+        logger.error(f"Failed to load {json_file}: {e}")
+        return None
 
 
 def load_papers_from_json(json_dir: Optional[str | Path] = None) -> list[Paper]:
@@ -85,32 +114,3 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> list[Paper]:
 
     logger.info(f"Loaded {len(papers)} papers from {json_dir}")
     return papers
-
-def load_paper(json_file: str | Path) -> Optional[Paper]:
-    """
-    Load a single Paper object from a JSON file.
-
-    Args:
-        json_file: Path to the JSON file
-    Returns:
-        Paper object or None if loading fails
-    """
-    try:
-        with open(json_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        paper = Paper(
-            source_file=data["source_file"],
-            id=data["id"],
-            title=data.get("title"),
-            authors=data.get("authors"),
-            year=data.get("year"),
-            publication=data.get("publication"),
-            processed=data.get("processed", False),
-            text=data.get("text", ""),
-        )
-        logger.info(f"Loaded: {json_file.name}")
-        return paper
-    except Exception as e:
-        logger.error(f"Failed to load {json_file}: {e}")
-        return None
