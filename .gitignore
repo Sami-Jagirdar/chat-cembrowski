@@ -35,6 +35,8 @@ wheels/
 # Data
 *.json
 *.pdf
+data/vectors/collection/
+data/vectors/.lock
 
 extras/
 notes

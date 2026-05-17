@@ -38,9 +38,9 @@ def get_qdrant_client() -> QdrantClient:
     Return a QdrantClient configured from environment variables.
 
     Local dev  → set nothing (uses embedded local DB at ROOT/data/vectors)
-    Production → set QDRANT_URL and QDRANT_API_KEY in your environment / .env
+    Production → set QDRANT_CLUSTER_ENDPOINT and QDRANT_API_KEY in your environment / .env
     """
-    qdrant_url = os.getenv("QDRANT_URL")
+    qdrant_url = os.getenv("QDRANT_CLUSTER_ENDPOINT")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     qdrant_local_path = os.getenv("QDRANT_LOCAL_PATH", QDRANT_LOCAL_PATH)
 
@@ -136,18 +136,21 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     client = get_qdrant_client()
-    ensure_collection(client, recreate=False)
 
-    for paper in load_papers_from_json():
-        if paper.processed:
-            logger.info(f"Paper '{paper.title}' (ID: {paper.id}) already processed — skipping.\n")
-            continue
+    try: 
+        ensure_collection(client, recreate=False)
+        for paper in load_papers_from_json():
+            if paper.processed:
+                logger.info(f"Paper '{paper.title}' (ID: {paper.id}) already processed — skipping.\n")
+                continue
 
-        chunks = chunk_paper(paper)
+            chunks = chunk_paper(paper)
 
-        if (embed_and_upsert(client, chunks)):
-            logger.info(f"Successfully embedded and upserted chunks for paper '{paper.title}' (ID: {paper.id}).\n")
-            paper.processed = True
-            save_paper(paper)
+            if (embed_and_upsert(client, chunks)):
+                logger.info(f"Successfully embedded and upserted chunks for paper '{paper.title}' (ID: {paper.id}).\n")
+                paper.processed = True
+                save_paper(paper)
+    finally:
+        client.close()
             
 
