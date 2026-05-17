@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from models import Paper
+from .models import Paper
 
 logger = logging.getLogger(__name__)
 

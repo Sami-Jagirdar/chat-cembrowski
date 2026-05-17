@@ -9,9 +9,9 @@ import uuid
 from pathlib import Path
 
 
-from models import Paper, Chunk
-from parser import preprocess_markdown
-from serialization import load_paper
+from .models import Paper, Chunk
+from .parser import preprocess_markdown
+from .serialization import load_paper
 
 
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
