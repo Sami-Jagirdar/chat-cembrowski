@@ -16,8 +16,6 @@ import requests
 from .models import Paper
 from .serialization import save_papers_to_json
 
-import pymupdf4llm
-
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -121,32 +119,6 @@ def _download_file(url: str, dest_path: Path) -> bool:
             dest_path.unlink()  # Remove incomplete file
         return False
 
-def _parse_pdf_for_text(pdf_path: Path) -> str:
-    """
-     Parse a single PDF file and extract text as markdown.
-
-    Args:
-        pdf_path: Path to PDF file
-
-    Returns:
-        pdf text or empty string if parsing fails
-    """
-    try:
-        pdf_path = Path(pdf_path)
-        if not pdf_path.exists():
-            logger.error(f"PDF file not found: {pdf_path}")
-            return ""
-        
-        text = pymupdf4llm.to_markdown(str(pdf_path))
-        if not text:
-            logger.warning(f"No text extracted from {pdf_path}")
-            return ""
-        return text
-    except Exception as e:
-        logger.error(f"Error parsing {pdf_path}: {e}")
-        return ""
-        
-
 def fetch_author_papers(
     author_id: str = DEFAULT_AUTHOR_ID,
     api_key: str = SERPAPI_KEY,
@@ -222,6 +194,7 @@ def fetch_author_papers(
             authors=authors,
             year=year,
             publication=publication,
+            processed=False
         )
         papers.append(paper)
         logger.info(f"Added paper: {title}")
