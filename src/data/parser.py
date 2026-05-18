@@ -38,6 +38,41 @@ def _parse_pdf_for_text(pdf_path: Path) -> str:
         logger.error(f"Error parsing {pdf_path}: {e}")
         return ""
 
+def parse_pdf_for_pages(pdf_path: Path) -> list[dict]:
+    """
+    Parse a single PDF and extract text per page using pymupdf4llm.
+
+    Args:
+        pdf_path: Path to PDF file
+
+    Returns:
+        List of page dicts with keys: 'text' (str), 'page' (1-based int).
+        Returns empty list if parsing fails.
+    """
+    try:
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            logger.error(f"PDF file not found: {pdf_path}")
+            return []
+
+        page_chunks = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+        if not page_chunks:
+            logger.warning(f"No text extracted from {pdf_path}")
+            return []
+
+        pages = []
+        for page_data in page_chunks:
+            text = page_data.get("text", "")
+            page_number = page_data.get("metadata", {}).get("page_number", 0)
+            if text.strip():
+                pages.append({"text": text, "page": page_number})
+
+        return pages
+
+    except Exception as e:
+        logger.error(f"Error parsing {pdf_path}: {e}")
+        return []
+
 def preprocess_markdown(text: str) -> str:
     """
     Clean markdown extracted from PDFs for RAG chunking.
