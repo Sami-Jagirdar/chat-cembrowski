@@ -15,7 +15,7 @@ from src.data.vectordb import (
 from .prompts import SYSTEM_PROMPT
 
 
-CHAT_MODEL = "gpt-4.1-mini"
+CHAT_MODEL = "gpt-4.1"
 
 
 @dataclass
