@@ -4,8 +4,8 @@ RAG Query System for answering questions based on George Cembrowski's publicatio
 ## Installation
 - Install uv if not already available 
 `python -m pip install uv`
-- Install project dependencies from pyproject.toml
-`uv install`
+- Install project dependencies and the package itself in editable mode
+`uv sync`
 
 ## Environment
 - Ensure you have a .env file with the SERPAPI_KEY, OPENAI_API_KEY, QDRANT_API_KEY and QDRANT_CLUSTER_ENPOINT variables
@@ -27,9 +27,9 @@ RAG Query System for answering questions based on George Cembrowski's publicatio
 To Create a Vector store of George Cembrowski's publications you have to run fetcher -> parser -> vectordb present in src/data package
 Run the following modules from the root of the repository
 
-1. `uv run -m src.data.fetcher` (You will have to manually download pdfs only if they don't already exist, then place them in the data/papers folder and rename them as instructed)
-2. `uv run -m src.data.parser`
-3. `uv run -m src.data.vectordb`
+1. `uv run -m chat_cembrowski.data.fetcher` (You will have to manually download pdfs only if they don't already exist, then place them in the data/papers folder and rename them as instructed)
+2. `uv run -m chat_cembrowski.data.parser`
+3. `uv run -m chat_cembrowski.data.vectordb`
 
 After these steps you should have a collection in your qdrant cluster with all the embeddings and their respective payloads
 

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 DEFAULT_AUTHOR_ID = "j8iA0kAAAAAJ"  # George Cembrowski's Google Scholar Author ID
-DATA_DIR = Path(__file__).resolve().parents[2] / "data/papers"
+DATA_DIR = Path(__file__).resolve().parents[3] / "data/papers"
 SERPAPI_BASE_URL = "https://serpapi.com/search"
 REQUEST_DELAY = 1  # Delay between requests in seconds
 

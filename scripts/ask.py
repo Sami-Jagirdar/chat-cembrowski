@@ -1,17 +1,11 @@
 import logging
-import os
-from pathlib import Path
-import sys
 
-# This is a workaround for now to be able to import from src/ until we package this properly.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) 
-
-from src.data.vectordb import (
+from chat_cembrowski.data.vectordb import (
     get_openai_client,
     get_qdrant_client,
 )
 
-from src.retrieval.query_engine import QueryEngine
+from chat_cembrowski.retrieval.query_engine import QueryEngine
 
 
 logging.basicConfig(level=logging.INFO)

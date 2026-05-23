@@ -36,7 +36,7 @@ VECTOR_DIM           = EMBEDDING_DIMENSIONS
 
 UPSERT_BATCH_SIZE = 64                # points per upsert call
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 QDRANT_LOCAL_PATH = PROJECT_ROOT / "data" / "vectors"
 
 

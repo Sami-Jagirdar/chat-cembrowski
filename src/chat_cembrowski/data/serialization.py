@@ -19,7 +19,7 @@ def save_paper(paper: Paper, output_dir: Optional[str | Path] = None) -> Optiona
         Path to the saved JSON file or None if saving fails
     """
     if output_dir is None:
-        output_dir = Path(__file__).resolve().parents[2] / "data" / "json"
+        output_dir = Path(__file__).resolve().parents[3] / "data" / "json"
     else:
         output_dir = Path(output_dir)
 
@@ -49,7 +49,7 @@ def save_papers_to_json(papers: list[Paper], output_dir: Optional[str | Path] = 
         Path to the output directory
     """
     if output_dir is None:
-        output_dir = Path(__file__).resolve().parents[2] / "data" / "json"
+        output_dir = Path(__file__).resolve().parents[3] / "data" / "json"
     else:
         output_dir = Path(output_dir)
 
@@ -110,7 +110,7 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> Iterator[Pap
         List of Paper objects
     """
     if json_dir is None:
-        json_dir = Path(__file__).resolve().parents[2] / "data" / "json"
+        json_dir = Path(__file__).resolve().parents[3] / "data" / "json"
     else:
         json_dir = Path(json_dir)
 

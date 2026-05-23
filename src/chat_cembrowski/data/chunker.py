@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 # characters per chunk
 CHUNK_OVERLAP = 128
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
 

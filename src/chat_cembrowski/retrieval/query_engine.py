@@ -6,7 +6,7 @@ from collections import OrderedDict
 from openai import OpenAI
 from qdrant_client import QdrantClient
 
-from src.data.vectordb import (
+from chat_cembrowski.data.vectordb import (
     COLLECTION_NAME,
     EMBEDDING_MODEL,
     EMBEDDING_DIMENSIONS,

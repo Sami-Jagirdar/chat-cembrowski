@@ -1,5 +1,4 @@
 .venv
-.agent.md
 .python-version
 *.pdf
 .env
@@ -40,3 +39,4 @@ data/vectors/.lock
 
 extras/
 notes
+claude_notes.md
