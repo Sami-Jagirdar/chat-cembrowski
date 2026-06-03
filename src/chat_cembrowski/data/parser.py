@@ -3,6 +3,7 @@ This module provides functions to parse PDF files, extract text as markdown, cle
 """
 
 import re
+from typing import Any, Dict, List
 import pymupdf4llm
 from pathlib import Path
 import logging
@@ -13,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
 
-def _parse_pdf_for_text(pdf_path: Path) -> str:
+def _parse_pdf_for_text(pdf_path: Path) -> str | List[Dict[str, Any]]:
     """
      Parse a single PDF file and extract text as markdown.
 
@@ -62,6 +63,8 @@ def parse_pdf_for_pages(pdf_path: Path) -> list[dict]:
 
         pages = []
         for page_data in page_chunks:
+            if not isinstance(page_data, dict):
+                continue
             text = page_data.get("text", "")
             page_number = page_data.get("metadata", {}).get("page_number", 0)
             if text.strip():
@@ -114,7 +117,7 @@ def preprocess_markdown(text: str) -> str:
     # Trim trailing whitespace
     text = re.sub(r"[ \t]+\n", "\n", text)
 
-    return text.strip()
+    return str(text.strip())
 
 def store_text_from_pdf(json_path: Path, pdf_path: Path):
     """

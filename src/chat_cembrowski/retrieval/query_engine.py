@@ -78,7 +78,7 @@ Context:
             ],
         )
 
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ""
 
     def _embed_query(self, question: str) -> list[float]:
         response = self.openai.embeddings.create(
@@ -100,17 +100,17 @@ Context:
         chunks = []
 
         for point in results:
-            payload = point.payload
+            payload = point.payload or {}
 
             chunks.append(
                 RetrievedChunk(
                     score=point.score,
-                    title=payload["title"],
-                    publication=payload["publication"],
+                    title=payload.get("title", "Unknown Title"),
+                    publication=payload.get("publication", "Unknown Publication"),
                     year=payload.get("year"),
-                    page_label=payload["page_label"],
-                    text=payload["text"],
-                    chunk_index=payload["chunk_index"],
+                    page_label=payload.get("page_label", "Unknown Pages"),
+                    text=payload.get("text", ""),
+                    chunk_index=payload.get("chunk_index", -1),
                 )
             )
 

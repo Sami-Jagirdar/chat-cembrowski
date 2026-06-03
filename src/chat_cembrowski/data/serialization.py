@@ -92,7 +92,7 @@ def load_paper(json_file: str | Path) -> Optional[Paper]:
             processed=data.get("processed", False),
             text=data.get("text", ""),
         )
-        logger.info(f"Loaded: {json_file.name}")
+        logger.info(f"Loaded: {Path(json_file).name}")
         return paper
     except Exception as e:
         logger.error(f"Failed to load {json_file}: {e}")

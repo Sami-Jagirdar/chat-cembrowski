@@ -10,6 +10,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Optional
+import uuid
 
 import serpapi
 import requests
@@ -20,7 +21,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+SERPAPI_KEY = str(os.getenv("SERPAPI_KEY"))
 DEFAULT_AUTHOR_ID = "j8iA0kAAAAAJ"  # George Cembrowski's Google Scholar Author ID
 DATA_DIR = Path(__file__).resolve().parents[3] / "data/papers"
 SERPAPI_BASE_URL = "https://serpapi.com/search"
@@ -113,7 +114,7 @@ def _download_file(url: str, dest_path: Path) -> bool:
         return True
     except requests.RequestException as e:
         logger.warning(f"Error downloading file")
-        if e.response.status_code == 403:
+        if e.response is not None and getattr(e.response, 'status_code', None) == 403:
             logger.warning(f"Access forbidden for chosen URL")
         if dest_path.exists():
             dest_path.unlink()  # Remove incomplete file
@@ -176,7 +177,8 @@ def fetch_author_papers(
 
         # Download the paper
         ext = "html" if resource_url.lower().endswith(".html") else "pdf"
-        filename = result_id + f".{ext}"
+        filename_id = result_id or title
+        filename = f"{filename_id}.{ext}"
         dest_path = data_dir / filename
 
         success = _download_file(resource_url, dest_path)
@@ -185,9 +187,11 @@ def fetch_author_papers(
             logger.info(f"Please manually download the article at url: {resource_url}. Rename it to {filename} and save it in {data_dir} to include it in the dataset.")
             input("Press Enter to continue")
             
+        paper_id = result_id.strip() if result_id and result_id.strip() else str(uuid.uuid7())
+
         # Create Paper object
         paper = Paper(
-            id=result_id,
+            id=paper_id,
             source_file=filename,
             text="",  # Placeholder, will be filled after parsing
             title=title,

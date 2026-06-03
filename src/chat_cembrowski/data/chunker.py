@@ -202,7 +202,7 @@ def chunk_paper_text_only(paper: Paper) -> list[Chunk]:
             Chunk(
                 id=str(uuid.uuid4()),
                 text=chunk_text,
-                payload=_build_payload(paper, i, chunk_text),
+                payload=_build_payload(paper, i, chunk_text, 1,1),
             )
         )
 
@@ -215,10 +215,13 @@ if __name__ == "__main__":
 
     # Example usage: load papers from JSON, chunk them, and print chunk info
     paper = load_paper(JSON_DIR / "DaZlHqgIxjgJ.json")
-    try:
-        chunks = chunk_paper(paper)
-        logger.info(f"Paper '{paper.title}' produced {len(chunks)} chunks.")
-    except Exception as e:
-        logger.error(f"Failed to chunk paper '{paper.title}': {e}")
-    
+    if not paper:
+        logger.error("Failed to load paper for chunking.")
+    else:
+        try:
+            chunks = chunk_paper(paper)
+            logger.info(f"Paper '{paper.title}' produced {len(chunks)} chunks.")
+        except Exception as e:
+            logger.error(f"Failed to chunk paper '{paper.title}': {e}")
+        
 
