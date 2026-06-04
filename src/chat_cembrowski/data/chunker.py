@@ -83,6 +83,14 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
         logger.warning(f"Paper {paper.id} yielded no page text. Skipping.")
         return []
 
+    # journal_page = pdf_page + page_offset
+    # Anchors the first non-empty PDF page to first_page_number, handling blank leading pages.
+    page_offset = (
+        paper.first_page_number - pages[0]["page"]
+        if paper.first_page_number is not None
+        else 0
+    )
+
     # ------------------------------------------------------------------
     # 1. Build a single stitched string and record the char offset at
     #    which each page begins.  The overlap is taken from the *tail* of
@@ -154,7 +162,9 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
                 id=str(uuid.uuid4()),
                 text=chunk_text,
                 payload=_build_payload(
-                    paper, i, chunk_text, chunk_start_page, chunk_end_page
+                    paper, i, chunk_text,
+                    chunk_start_page + page_offset,
+                    chunk_end_page + page_offset,
                 ),
             )
         )
