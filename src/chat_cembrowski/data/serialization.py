@@ -89,6 +89,7 @@ def load_paper(json_file: str | Path) -> Optional[Paper]:
             authors=data.get("authors"),
             year=data.get("year"),
             publication=data.get("publication"),
+            first_page_number=data.get("first_page_number"),
             processed=data.get("processed", False),
             text=data.get("text", ""),
         )

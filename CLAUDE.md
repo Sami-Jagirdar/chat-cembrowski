@@ -9,7 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync
 
 # Run data pipeline stages (order matters)
-uv run -m chat_cembrowski.data.fetcher        # 1. Fetch papers via SerpAPI Google Scholar
+uv run -m chat_cembrowski.data.ingestion      # 1a. Fetch papers via SerpAPI Google Scholar
+uv run -m chat_cembrowski.data.ingestion ingest_local  # 1b. Create Paper objects from locally-sourced PDFs
 uv run -m chat_cembrowski.data.parser         # 2. Parse PDFs → markdown, store in data/json/
 uv run -m chat_cembrowski.data.vectordb       # 3. Chunk + embed + upsert to Qdrant
 
@@ -30,7 +31,7 @@ This is a RAG (Retrieval-Augmented Generation) system that answers questions abo
 src/chat_cembrowski/
   data/              # Data ingestion pipeline
     models.py        # Paper and Chunk dataclasses
-    fetcher.py       # SerpAPI Google Scholar Author API → downloads PDFs
+    ingestion.py     # SerpAPI fetch + local PDF bootstrap → creates Paper JSON objects
     parser.py        # pymupdf4llm PDF → markdown, per-page extraction
     chunker.py       # LangChain RecursiveCharacterTextSplitter (1024 chars, 128 overlap)
     serialization.py # JSON read/write for Paper objects
@@ -50,7 +51,7 @@ extras/               # Miscellaneous files not part of the pipeline (gitignored
 
 ### Data flow
 
-1. **fetcher.py** — Calls SerpAPI's Google Scholar Author API to get Cembrowski's articles, searches each for public PDF/HTML downloads, downloads them to `data/papers/`. If a download fails, prompts the user to manually download and rename it.
+1. **ingestion.py** — Two entry points: `fetch_author_papers()` calls SerpAPI's Google Scholar Author API, downloads PDFs, and saves Paper JSON objects (authors truncated by SerpAPI are stored with `"..."` as a sentinel). `ingest_local_pdfs()` scans `data/papers/` for PDFs without a JSON entry and creates Paper objects by extracting first-page text via PyMuPDF and calling GPT-4.1-mini for structured metadata; it also patches any existing Paper whose authors list contains `"..."` using the same first-page extraction.
 2. **parser.py** — Parses each PDF via `pymupdf4llm.to_markdown()` and writes the extracted markdown into the corresponding JSON file in `data/json/`. Also provides `parse_pdf_for_pages()` for per-page extraction used by the chunker.
 3. **chunker.py** — Stitches per-page text with overlap, splits with LangChain's `RecursiveCharacterTextSplitter` (markdown-aware), maps each chunk back to source page numbers via character offsets. Uses `chunk_size=1024`, `chunk_overlap=128`.
 4. **vectordb.py** — Embeds chunks via OpenAI (batching 64 texts per call) and upserts them as `PointStruct`s into Qdrant collection `cembrowski_papers_v3`. Sets `Paper.processed = True` on success.

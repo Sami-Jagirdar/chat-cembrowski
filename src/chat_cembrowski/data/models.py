@@ -11,6 +11,7 @@ class Paper:
     authors: Optional[list[str]] = None
     year: Optional[int] = None
     publication: Optional[str] = None
+    first_page_number: Optional[int] = None
     processed: bool = False
     text: str = ""
 
@@ -22,6 +23,7 @@ class Paper:
             "authors": self.authors,
             "year": self.year,
             "publication": self.publication,
+            "first_page_number": self.first_page_number,
             "processed": self.processed,
             "text": self.text,
         }
