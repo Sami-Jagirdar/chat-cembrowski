@@ -44,42 +44,52 @@ def _block_text(block: dict) -> str:
 def _find_caption(
     page: fitz.Page, img_rect: fitz.Rect
 ) -> tuple[Optional[str], Optional[str]]:
-    """
-    Search for a caption near img_rect using bounding-box proximity.
-    Searches below the image first (figures), then above (tables).
-    Returns (caption_text, image_type) or (None, None).
-    """
     text_blocks = [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0]
 
     def h_overlap(bbox) -> bool:
         return bbox[0] < img_rect.x1 and bbox[2] > img_rect.x0
 
+    def v_overlap(bbox) -> bool:
+        return bbox[1] < img_rect.y1 and bbox[3] > img_rect.y0
+
     below = sorted(
-        [
-            b for b in text_blocks
-            if b["bbox"][1] >= img_rect.y1 - 5
-            and b["bbox"][1] <= img_rect.y1 + CAPTION_PROXIMITY
-            and h_overlap(b["bbox"])
-        ],
+        [b for b in text_blocks
+         if b["bbox"][1] >= img_rect.y1 - 5
+         and b["bbox"][1] <= img_rect.y1 + CAPTION_PROXIMITY
+         and h_overlap(b["bbox"])],
         key=lambda b: b["bbox"][1],
     )
     above = sorted(
-        [
-            b for b in text_blocks
-            if b["bbox"][3] <= img_rect.y0 + 5
-            and b["bbox"][3] >= img_rect.y0 - CAPTION_PROXIMITY
-            and h_overlap(b["bbox"])
-        ],
+        [b for b in text_blocks
+         if b["bbox"][3] <= img_rect.y0 + 5
+         and b["bbox"][3] >= img_rect.y0 - CAPTION_PROXIMITY
+         and h_overlap(b["bbox"])],
         key=lambda b: -b["bbox"][3],
     )
+    left = sorted(
+        [b for b in text_blocks
+         if b["bbox"][2] <= img_rect.x0 + 5
+         and b["bbox"][2] >= img_rect.x0 - CAPTION_PROXIMITY
+         and v_overlap(b["bbox"])],
+        key=lambda b: -b["bbox"][2],
+    )
+    right = sorted(
+        [b for b in text_blocks
+         if b["bbox"][0] >= img_rect.x1 - 5
+         and b["bbox"][0] <= img_rect.x1 + CAPTION_PROXIMITY
+         and v_overlap(b["bbox"])],
+        key=lambda b: b["bbox"][0],
+    )
 
-    for block in (below or above):
-        text = _block_text(block)
-        m = CAPTION_RE.search(text)
-        if m:
-            label = m.group(1).lower()
-            image_type = "figure" if label.startswith("fig") else label
-            return text, image_type
+    # Check each direction independently in priority order.
+    for candidates in (below, above, left, right):
+        for block in candidates:
+            text = _block_text(block)
+            m = CAPTION_RE.search(text)
+            if m:
+                label = m.group(1).lower()
+                image_type = "figure" if label.startswith("fig") else label
+                return text, image_type
 
     return None, None
 
