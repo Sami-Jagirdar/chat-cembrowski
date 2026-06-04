@@ -40,7 +40,7 @@ data/
 ## Design Decisions and Models Used
 
 - **Vector Embeddings**: Voyage AI `voyage-multimodal-3.5` (1024 dimensions) — handles text and image+text pairs in the same vector space
-- **Answer Generation**: OpenAI `gpt-4.1-mini`
+- **Answer Generation**: OpenAI `gpt-4.1`
 - **Chunking**: Language-aware recursive chunking — code files use language-specific splitters (Python, JS, TS, C++, Java, etc.), prose and docx use a markdown-aware splitter. `CHUNK_SIZE=1024`, `CHUNK_OVERLAP=128`
 - **Retrieval**: Top 10 chunks from Qdrant vector search
 - **PDF Parsing**: `pymupdf4llm` — extracts text, tables, and charts as structured markdown with automatic OCR if needed
