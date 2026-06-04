@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Iterator, Optional
 
-from .models import Paper
+from .models import Paper, ImageRecord
 
 logger = logging.getLogger(__name__)
 
@@ -140,3 +140,54 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> Iterator[Pap
             yield paper
         except Exception as e:
             logger.error(f"Failed to load {json_file}: {e}")
+
+
+def load_image_records_for_paper(
+    paper_id: str,
+    image_json_dir: Optional[str | Path] = None,
+) -> list[ImageRecord]:
+    """
+    Load all ImageRecord JSONs belonging to paper_id from image_json_dir.
+
+    Args:
+        paper_id: ID of the paper whose images to load
+        image_json_dir: Directory containing image JSON files (default: data/image_json)
+
+    Returns:
+        List of ImageRecord objects for the given paper
+    """
+    if image_json_dir is None:
+        image_json_dir = Path(__file__).resolve().parents[3] / "data" / "image_json"
+    else:
+        image_json_dir = Path(image_json_dir)
+
+    if not image_json_dir.exists():
+        logger.warning(f"Image JSON directory not found: {image_json_dir}")
+        return []
+
+    records: list[ImageRecord] = []
+    for json_file in image_json_dir.glob("*.json"):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("paper_id") != paper_id:
+                continue
+            records.append(
+                ImageRecord(
+                    id=data["id"],
+                    paper_id=data["paper_id"],
+                    source_file=data["source_file"],
+                    page=data["page"],
+                    bbox=tuple(data["bbox"]),
+                    caption=data.get("caption"),
+                    image_type=data.get("image_type"),
+                    title=data.get("title"),
+                    authors=data.get("authors"),
+                    year=data.get("year"),
+                    publication=data.get("publication"),
+                )
+            )
+            logger.info(f"Loaded image record: {json_file.name}")
+        except Exception as e:
+            logger.warning(f"Failed to load image record {json_file.name}: {e}")
+    return records

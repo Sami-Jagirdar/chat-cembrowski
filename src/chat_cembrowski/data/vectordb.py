@@ -1,5 +1,7 @@
+#type: ignore
 """
 Qdrant client factory, collection management, and batch upsert for Chunk objects.
+Uses Voyage AI multimodal embeddings (voyage-multimodal-3.5) for both text and image chunks.
 """
 
 import logging
@@ -9,14 +11,10 @@ from typing import Iterator
 from pathlib import Path
 from dotenv import load_dotenv
 
-
+import PIL.Image
+import voyageai
 from qdrant_client import QdrantClient
-from openai import OpenAI
-from qdrant_client.models import (
-    Distance,
-    PointStruct,
-    VectorParams,
-)
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from .chunker import Chunk
 
@@ -24,20 +22,17 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-COLLECTION_NAME = "cembrowski_papers_v3"
+COLLECTION_NAME = "jenna_rimkus_papers"
 
-# text-embedding-3-large supports Matryoshka truncation via the `dimensions`
-# parameter.  1024 dims retains most retrieval quality (~94 % of full 3072)
-# while using only 1/3 the storage.  Switch VECTOR_DIM + EMBEDDING_DIMENSIONS
-# together if you ever want to experiment with other sizes.
-EMBEDDING_MODEL      = "text-embedding-3-large"
-EMBEDDING_DIMENSIONS = 1024           # truncated via OpenAI's native param
-VECTOR_DIM           = EMBEDDING_DIMENSIONS
+EMBEDDING_MODEL = "voyage-multimodal-3.5"
+VECTOR_DIM = 1024
 
-UPSERT_BATCH_SIZE = 64                # points per upsert call
+TEXT_BATCH_SIZE = 64
+IMAGE_BATCH_SIZE = 16    # images are token-heavier; keep batches smaller
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 QDRANT_LOCAL_PATH = PROJECT_ROOT / "data" / "vectors"
+IMAGES_DIR = PROJECT_ROOT / "data" / "images"
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -60,15 +55,12 @@ def get_qdrant_client() -> QdrantClient:
     return QdrantClient(path=qdrant_local_path)
 
 
-def get_openai_client() -> OpenAI:
-    """
-    Return an OpenAI client configured from environment variables.
-    Requires OPENAI_API_KEY in your environment / .env.
-    """
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY not set in environment.")
-    return OpenAI(api_key=openai_api_key)
+def get_voyage_client() -> voyageai.Client:
+    """Return a Voyage AI client. Reads VOYAGE_API_KEY from environment / .env."""
+    api_key = os.getenv("VOYAGE_API_KEY")
+    if not api_key:
+        raise ValueError("VOYAGE_API_KEY not set in environment.")
+    return voyageai.Client(api_key=api_key)
 
 
 def ensure_collection(client: QdrantClient, recreate: bool = False) -> None:
@@ -76,9 +68,9 @@ def ensure_collection(client: QdrantClient, recreate: bool = False) -> None:
     Create the collection if it doesn't exist.
 
     Args:
-        client:    Active QdrantClient.
-        recreate:  If True, drop and recreate (useful for re-indexing from
-                   scratch).  Note: if you change VECTOR_DIM you must recreate.
+        client:   Active QdrantClient.
+        recreate: If True, drop and recreate (required when changing VECTOR_DIM
+                  or switching embedding models).
     """
     exists = client.collection_exists(COLLECTION_NAME)
 
@@ -97,9 +89,7 @@ def ensure_collection(client: QdrantClient, recreate: bool = False) -> None:
             f"(model={EMBEDDING_MODEL}, dim={VECTOR_DIM})."
         )
     else:
-        logger.info(
-            f"Collection '{COLLECTION_NAME}' already exists — skipping creation."
-        )
+        logger.info(f"Collection '{COLLECTION_NAME}' already exists — skipping creation.")
 
 
 def _batched(iterable, n: int) -> Iterator[list]:
@@ -109,28 +99,61 @@ def _batched(iterable, n: int) -> Iterator[list]:
         yield batch
 
 
-def _embed_texts(openai_client: OpenAI, texts: list[str]) -> list[list[float]]:
-    """
-    Call the OpenAI embeddings endpoint for a batch of texts.
-
-    Uses the `dimensions` parameter to truncate text-embedding-3-large output
-    to EMBEDDING_DIMENSIONS, keeping storage lean without a separate PCA step.
-    OpenAI's Matryoshka training ensures truncated vectors still rank well.
-    """
-    response = openai_client.embeddings.create(
+def _embed_text_batch(vo: voyageai.Client, chunks: list[Chunk]) -> list[list[float]]:
+    """Embed a batch of text chunks via the Voyage multimodal endpoint."""
+    result = vo.multimodal_embed(
+        inputs=[c.text for c in chunks],
         model=EMBEDDING_MODEL,
-        input=texts,
-        dimensions=EMBEDDING_DIMENSIONS,
+        input_type="document",
     )
-    # Response items are guaranteed to be in the same order as the input.
-    return [item.embedding for item in response.data]
+    return result.embeddings
+
+
+def _embed_image_batch(
+    vo: voyageai.Client,
+    chunks: list[Chunk],
+    images_dir: Path,
+) -> tuple[list[Chunk], list[list[float]]]:
+    """
+    Embed a batch of image chunks via the Voyage multimodal endpoint.
+
+    Each input is a [text, PIL.Image] pair where text is the caption + paper
+    metadata assembled by the chunker.  Chunks whose image file is missing or
+    unreadable are skipped; the returned lists are always parallel.
+    """
+    valid_chunks: list[Chunk] = []
+    inputs = []
+
+    for chunk in chunks:
+        image_path = images_dir / chunk.payload["source_file"]
+        if not image_path.exists():
+            logger.warning(f"Image file not found, skipping: {image_path.name}")
+            continue
+        try:
+            img = PIL.Image.open(image_path)
+        except Exception as e:
+            logger.warning(f"Failed to open image {image_path.name}: {e}")
+            continue
+
+        # Always include text if present; Voyage handles text-only or mixed inputs.
+        inputs.append([chunk.text, img] if chunk.text else [img])
+        valid_chunks.append(chunk)
+
+    if not inputs:
+        return [], []
+
+    result = vo.multimodal_embed(
+        inputs=inputs,
+        model=EMBEDDING_MODEL,
+        input_type="document",
+    )
+    return valid_chunks, result.embeddings
 
 
 def _chunks_to_points(
     chunks: list[Chunk],
     embeddings: list[list[float]],
 ) -> list[PointStruct]:
-    """Zip chunks with their embeddings into Qdrant PointStructs."""
     assert len(chunks) == len(embeddings), (
         f"Chunk count ({len(chunks)}) != embedding count ({len(embeddings)})"
     )
@@ -142,57 +165,80 @@ def _chunks_to_points(
 
 def embed_and_upsert(
     client: QdrantClient,
-    openai_client: OpenAI,
+    vo: voyageai.Client,
     chunks: list[Chunk],
+    images_dir: Path = IMAGES_DIR,
+    collection_name: str = COLLECTION_NAME,
 ) -> int:
     """
-    Embed a list of Chunk objects via OpenAI and upsert them into Qdrant in
-    batches.
+    Embed and upsert a mixed list of text and image Chunk objects into Qdrant.
+
+    Routes by chunk_category: text chunks are embedded as plain text; image
+    chunks are embedded as (text, image) pairs using the Voyage multimodal model.
 
     Args:
-        client:        Active QdrantClient (from get_qdrant_client()).
-        openai_client: Active OpenAI client (from get_openai_client()).
-        chunks:        Output of chunk_paper() — one or more papers' worth.
+        client:     Active QdrantClient.
+        vo:         Active Voyage AI client.
+        chunks:     Output of chunk_paper() + chunk_paper_images() for one or
+                    more papers.
+        images_dir: Directory containing extracted image files.
+        collection_name: Qdrant collection to upsert into.
 
     Returns:
-        Total number of points upserted.
+        Total number of points successfully upserted.
     """
     if not chunks:
         logger.warning("embed_and_upsert called with empty chunk list.")
         return 0
 
+    text_chunks  = [c for c in chunks if c.payload.get("chunk_category") == "text"]
+    image_chunks = [c for c in chunks if c.payload.get("chunk_category") == "image"]
+
     total_upserted = 0
 
-    for batch in _batched(chunks, UPSERT_BATCH_SIZE):
-        texts = [c.text for c in batch]
-
+    for batch in _batched(text_chunks, TEXT_BATCH_SIZE):
         try:
-            embeddings = _embed_texts(openai_client, texts)
+            embeddings = _embed_text_batch(vo, batch)
         except Exception as e:
-            logger.error(f"OpenAI embedding failed for batch: {e}")
+            logger.error(f"Voyage text embedding failed: {e}")
             continue
-
         points = _chunks_to_points(batch, embeddings)
-
         try:
-            client.upsert(collection_name=COLLECTION_NAME, points=points)
+            client.upsert(collection_name=collection_name, points=points)
             total_upserted += len(points)
-            logger.debug(f"Upserted {len(points)} points.")
+            logger.debug(f"Upserted {len(points)} text points.")
         except Exception as e:
-            logger.error(f"Qdrant upsert failed: {e}")
+            logger.error(f"Qdrant upsert failed (text batch): {e}")
+
+    for batch in _batched(image_chunks, IMAGE_BATCH_SIZE):
+        try:
+            valid_chunks, embeddings = _embed_image_batch(vo, batch, images_dir)
+        except Exception as e:
+            logger.error(f"Voyage image embedding failed: {e}")
+            continue
+        if not valid_chunks:
+            continue
+        points = _chunks_to_points(valid_chunks, embeddings)
+        try:
+            client.upsert(collection_name=collection_name, points=points)
+            total_upserted += len(points)
+            logger.debug(f"Upserted {len(points)} image points.")
+        except Exception as e:
+            logger.error(f"Qdrant upsert failed (image batch): {e}")
 
     logger.info(f"Total upserted: {total_upserted} points.")
     return total_upserted
 
 
 if __name__ == "__main__":
-    from .chunker import chunk_paper
+    from .chunker import chunk_paper, chunk_paper_images
     from .serialization import load_papers_from_json, save_paper
 
     logging.basicConfig(level=logging.INFO)
 
     client = get_qdrant_client()
-    openai_client = get_openai_client()
+    vo = get_voyage_client()
+    collection_name = "jenna_rimkus_papers"  # change if you want to use a different collection
 
     try:
         ensure_collection(client, recreate=False)
@@ -204,11 +250,11 @@ if __name__ == "__main__":
                 )
                 continue
 
-            chunks = chunk_paper(paper)
+            chunks = chunk_paper(paper) + chunk_paper_images(paper)
 
-            if embed_and_upsert(client, openai_client, chunks):
+            if embed_and_upsert(client, vo, chunks, collection_name=collection_name) > 0:
                 logger.info(
-                    f"Successfully embedded and upserted chunks for paper "
+                    f"Embedded and upserted chunks for paper "
                     f"'{paper.title}' (ID: {paper.id}).\n"
                 )
                 paper.processed = True

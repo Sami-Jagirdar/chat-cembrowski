@@ -11,8 +11,9 @@ dependencies = [
     "serpapi>=1.0.2",
     "python-dotenv>=1.0.0",
     "langchain-text-splitters>=1.1.2",
-    "fastembed>=0.8.0",
     "openai>=2.37.0",
+    "voyageai>=0.3.2",
+    "Pillow>=11.0.0",
 ]
 
 [build-system]

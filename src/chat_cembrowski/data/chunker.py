@@ -9,9 +9,9 @@ import uuid
 from pathlib import Path
 
 
-from .models import Paper, Chunk
+from .models import Paper, Chunk, ImageRecord
 from .parser import preprocess_markdown, parse_pdf_for_pages
-from .serialization import load_paper
+from .serialization import load_paper, load_image_records_for_paper
 
 
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
@@ -24,6 +24,7 @@ CHUNK_OVERLAP = 128
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
+IMAGE_JSON_DIR = PROJECT_ROOT / "data/image_json"
 
 def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: int, page_end: int) -> dict:
     """
@@ -38,12 +39,12 @@ def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: 
         Dictionary payload with paper metadata and chunk info
     """
     return {
+        "chunk_category": "text",
         "paper_id": paper.id,
         "title": paper.title,
         "authors": paper.authors,
         "year": paper.year,
         "publication": paper.publication,
-        "authors": paper.authors,
         "chunk_index": chunk_index,
         "page_start": page_start,
         "page_end": page_end,
@@ -53,7 +54,6 @@ def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: 
             else f"pp. {page_start}–{page_end}"
         ),
         "text": chunk_text,
-
     }
 
 # How many characters to overlap between adjacent pages to preserve
@@ -160,7 +160,7 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
         chunks.append(
             Chunk(
                 id=str(uuid.uuid4()),
-                text=chunk_text,
+                text=_build_text_embed_text(paper, chunk_text),
                 payload=_build_payload(
                     paper, i, chunk_text,
                     chunk_start_page + page_offset,
@@ -211,12 +211,92 @@ def chunk_paper_text_only(paper: Paper) -> list[Chunk]:
         chunks.append(
             Chunk(
                 id=str(uuid.uuid4()),
-                text=chunk_text,
-                payload=_build_payload(paper, i, chunk_text, 1,1),
+                text=_build_text_embed_text(paper, chunk_text),
+                payload=_build_payload(paper, i, chunk_text, 1, 1),
             )
         )
 
     logger.info(f"Paper {paper.id} split into {len(chunks)} chunks.")
+    return chunks
+
+
+
+def _build_text_embed_text(paper: Paper, chunk_text: str) -> str:
+    """Prepend paper metadata to chunk text so the embedding carries provenance context."""
+    parts: list[str] = []
+    if paper.title:
+        parts.append(f"Title: {paper.title}")
+    if paper.year:
+        parts.append(f"Year: {paper.year}")
+    if paper.publication:
+        parts.append(f"Publication: {paper.publication}")
+    parts.append(chunk_text)
+    return "\n".join(parts)
+
+
+def _build_image_embed_text(record: ImageRecord) -> str:
+    """
+    Compose the text input sent to Voyage alongside the image.
+    Caption anchors semantics; paper metadata improves retrieval precision.
+    """
+    parts: list[str] = []
+    if record.caption:
+        parts.append(record.caption)
+    if record.title:
+        parts.append(f"Title: {record.title}")
+    if record.year:
+        parts.append(f"Year: {record.year}")
+    if record.publication:
+        parts.append(f"Publication: {record.publication}")
+    return "\n".join(parts)
+
+
+def _build_image_payload(record: ImageRecord, chunk_index: int) -> dict:
+    return {
+        "chunk_category": "image",
+        "paper_id": record.paper_id,
+        "title": record.title,
+        "authors": record.authors,
+        "year": record.year,
+        "publication": record.publication,
+        "chunk_index": chunk_index,
+        "page": record.page,
+        "page_label": f"p. {record.page}",
+        "source_file": record.source_file,
+        "bbox": list(record.bbox),
+        "caption": record.caption,
+        "image_type": record.image_type,
+        "text": _build_image_embed_text(record),
+    }
+
+
+def chunk_paper_images(
+    paper: Paper,
+    image_json_dir: Path = IMAGE_JSON_DIR,
+) -> list[Chunk]:
+    """
+    Convert all extracted ImageRecords for a paper into Chunk objects.
+
+    Chunk.text is the text input Voyage will receive alongside the image
+    (caption + title + year + publication).  Chunk.id matches ImageRecord.id
+    so vectordb can locate the image file without an extra lookup.
+    """
+    records = load_image_records_for_paper(paper.id, image_json_dir)
+    if not records:
+        logger.info(f"No image records found for paper {paper.id}.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, record in enumerate(records):
+        chunks.append(
+            Chunk(
+                id=record.id,
+                text=_build_image_embed_text(record),
+                payload=_build_image_payload(record, i),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} image chunks.")
     return chunks
 
 
