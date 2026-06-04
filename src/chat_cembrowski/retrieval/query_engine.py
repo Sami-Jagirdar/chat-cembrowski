@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections import OrderedDict
 
+import voyageai
 from openai import OpenAI
 from qdrant_client import QdrantClient
 
 from chat_cembrowski.data.vectordb import (
     COLLECTION_NAME,
     EMBEDDING_MODEL,
-    EMBEDDING_DIMENSIONS,
 )
 
 from .prompts import SYSTEM_PROMPT
@@ -21,12 +20,16 @@ CHAT_MODEL = "gpt-4.1-mini"
 @dataclass
 class RetrievedChunk:
     score: float
+    source_type: str        # "paper" or "document"
     title: str
-    publication: str
-    year: int | None
-    page_label: str
     text: str
     chunk_index: int
+    # Paper-specific
+    publication: str | None = None
+    year: int | None = None
+    page_label: str | None = None
+    # Document-specific
+    file_type: str | None = None
 
 
 class QueryEngine:
@@ -34,10 +37,12 @@ class QueryEngine:
         self,
         qdrant_client: QdrantClient,
         openai_client: OpenAI,
+        voyage_client: voyageai.Client, # type: ignore
         top_k: int = 10,
     ) -> None:
         self.qdrant = qdrant_client
         self.openai = openai_client
+        self.voyage = voyage_client
         self.top_k = top_k
 
     def query(self, question: str) -> str:
@@ -81,13 +86,12 @@ Context:
         return response.choices[0].message.content or ""
 
     def _embed_query(self, question: str) -> list[float]:
-        response = self.openai.embeddings.create(
+        result = self.voyage.multimodal_embed(
+            inputs=[[question]],
             model=EMBEDDING_MODEL,
-            input=question,
-            dimensions=EMBEDDING_DIMENSIONS,
+            input_type="query",
         )
-
-        return response.data[0].embedding
+        return result.embeddings[0]
 
     def _search(self, query_embedding: list[float]) -> list[RetrievedChunk]:
         results = self.qdrant.query_points(
@@ -101,42 +105,57 @@ Context:
 
         for point in results:
             payload = point.payload or {}
+            source_type = payload.get("source_type", "paper")
 
-            chunks.append(
-                RetrievedChunk(
-                    score=point.score,
-                    title=payload.get("title", "Unknown Title"),
-                    publication=payload.get("publication", "Unknown Publication"),
-                    year=payload.get("year"),
-                    page_label=payload.get("page_label", "Unknown Pages"),
-                    text=payload.get("text", ""),
-                    chunk_index=payload.get("chunk_index", -1),
+            if source_type == "document":
+                chunks.append(
+                    RetrievedChunk(
+                        score=point.score,
+                        source_type="document",
+                        title=payload.get("title", "Unknown Document"),
+                        text=payload.get("text", ""),
+                        chunk_index=payload.get("chunk_index", -1),
+                        file_type=payload.get("file_type"),
+                    )
                 )
-            )
+            else:
+                chunks.append(
+                    RetrievedChunk(
+                        score=point.score,
+                        source_type="paper",
+                        title=payload.get("title", "Unknown Title"),
+                        text=payload.get("text", ""),
+                        chunk_index=payload.get("chunk_index", -1),
+                        publication=payload.get("publication"),
+                        year=payload.get("year"),
+                        page_label=payload.get("page_label"),
+                    )
+                )
 
         return chunks
 
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
-        """
-        Build retrieval context for the LLM.
-
-        Deduplicates repeated chunk references while preserving order.
-        """
+        """Build retrieval context for the LLM, rendering papers and documents differently."""
         sections = []
 
         for i, chunk in enumerate(chunks, start=1):
+            if chunk.source_type == "document":
+                header_lines = [f"Title: {chunk.title}"]
+                if chunk.file_type:
+                    header_lines.append(f"Type: {chunk.file_type}")
+                header = "\n".join(header_lines)
+            else:
+                header_lines = [f"Title: {chunk.title}"]
+                if chunk.publication:
+                    header_lines.append(f"Publication: {chunk.publication}")
+                if chunk.year:
+                    header_lines.append(f"Year: {chunk.year}")
+                if chunk.page_label:
+                    header_lines.append(f"Pages: {chunk.page_label}")
+                header = "\n".join(header_lines)
+
             sections.append(
-                f"""
-SOURCE {i}
-
-Title: {chunk.title}
-Publication: {chunk.publication}
-Year: {chunk.year}
-Pages: {chunk.page_label}
-
-Content:
-{chunk.text}
-""".strip()
+                f"SOURCE {i}\n\n{header}\n\nContent:\n{chunk.text}"
             )
 
         return "\n\n====================\n\n".join(sections)

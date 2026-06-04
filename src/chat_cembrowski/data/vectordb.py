@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 import PIL.Image
 import voyageai
+from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -26,6 +27,7 @@ COLLECTION_NAME = "jenna_rimkus_papers"
 
 EMBEDDING_MODEL = "voyage-multimodal-3.5"
 VECTOR_DIM = 1024
+EMBEDDING_DIMENSIONS = VECTOR_DIM  # alias for query_engine compatibility
 
 TEXT_BATCH_SIZE = 64
 IMAGE_BATCH_SIZE = 16    # images are token-heavier; keep batches smaller
@@ -61,6 +63,14 @@ def get_voyage_client() -> voyageai.Client:
     if not api_key:
         raise ValueError("VOYAGE_API_KEY not set in environment.")
     return voyageai.Client(api_key=api_key)
+
+
+def get_openai_client() -> OpenAI:
+    """Return an OpenAI client. Reads OPENAI_API_KEY from environment / .env."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not set in environment.")
+    return OpenAI(api_key=api_key)
 
 
 def ensure_collection(client: QdrantClient, recreate: bool = False) -> None:

@@ -3,6 +3,7 @@ import logging
 from chat_cembrowski.data.vectordb import (
     get_openai_client,
     get_qdrant_client,
+    get_voyage_client,
 )
 
 from chat_cembrowski.retrieval.query_engine import QueryEngine
@@ -14,10 +15,12 @@ logging.basicConfig(level=logging.INFO)
 def main() -> None:
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
+    voyage_client = get_voyage_client()
 
     engine = QueryEngine(
         qdrant_client=qdrant_client,
         openai_client=openai_client,
+        voyage_client=voyage_client,
         top_k=10,
     )
 
