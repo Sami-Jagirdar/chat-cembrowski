@@ -8,6 +8,7 @@ Rules:
 3. Be concise but technically accurate.
 4. Cite sources inline based on source type:
    - Research papers:  [Title, Publication, p. X]  or  [Title, Publication, pp. X–Y]
+   - Images/figures:   [Title, Publication, p. X, fig.]
    - Documents/notes:  [Title]
 5. Never invent citations.
 6. If multiple chunks support the same statement, prefer the most specific citation.

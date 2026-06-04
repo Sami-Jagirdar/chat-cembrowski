@@ -30,6 +30,9 @@ class RetrievedChunk:
     page_label: str | None = None
     # Document-specific
     file_type: str | None = None
+    # Image-specific
+    caption: str | None = None
+    image_type: str | None = None
 
 
 class QueryEngine:
@@ -105,9 +108,25 @@ Context:
 
         for point in results:
             payload = point.payload or {}
+            chunk_category = payload.get("chunk_category", "text")
             source_type = payload.get("source_type", "paper")
 
-            if source_type == "document":
+            if chunk_category == "image":
+                chunks.append(
+                    RetrievedChunk(
+                        score=point.score,
+                        source_type="image",
+                        title=payload.get("title", "Unknown Title"),
+                        text=payload.get("text", ""),
+                        chunk_index=payload.get("chunk_index", -1),
+                        publication=payload.get("publication"),
+                        year=payload.get("year"),
+                        page_label=payload.get("page_label"),
+                        caption=payload.get("caption"),
+                        image_type=payload.get("image_type"),
+                    )
+                )
+            elif source_type == "document":
                 chunks.append(
                     RetrievedChunk(
                         score=point.score,
@@ -144,6 +163,21 @@ Context:
                 if chunk.file_type:
                     header_lines.append(f"Type: {chunk.file_type}")
                 header = "\n".join(header_lines)
+                body = chunk.text
+
+            elif chunk.source_type == "image":
+                header_lines = [f"Title: {chunk.title}"]
+                if chunk.publication:
+                    header_lines.append(f"Publication: {chunk.publication}")
+                if chunk.year:
+                    header_lines.append(f"Year: {chunk.year}")
+                if chunk.page_label:
+                    header_lines.append(f"Pages: {chunk.page_label}")
+                if chunk.image_type:
+                    header_lines.append(f"Image Type: {chunk.image_type}")
+                header = "\n".join(header_lines)
+                body = chunk.caption or chunk.text
+
             else:
                 header_lines = [f"Title: {chunk.title}"]
                 if chunk.publication:
@@ -153,9 +187,10 @@ Context:
                 if chunk.page_label:
                     header_lines.append(f"Pages: {chunk.page_label}")
                 header = "\n".join(header_lines)
+                body = chunk.text
 
             sections.append(
-                f"SOURCE {i}\n\n{header}\n\nContent:\n{chunk.text}"
+                f"SOURCE {i}\n\n{header}\n\nContent:\n{body}"
             )
 
         return "\n\n====================\n\n".join(sections)
