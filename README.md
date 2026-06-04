@@ -29,7 +29,8 @@ Run the following modules from the root of the repository
 
 1. `uv run -m chat_cembrowski.data.ingestion` (You will have to manually download pdfs only if they don't already exist, then place them in the data/papers folder and rename them as instructed)
 2. `uv run -m chat_cembrowski.data.parser`
-3. `uv run -m chat_cembrowski.data.vectordb`
+3. `uv run -m chat_cembrowski.data.image_extractor` 
+4. `uv run -m chat_cembrowski.data.vectordb`
 
 After these steps you should have a collection in your qdrant cluster with all the embeddings and their respective payloads
 

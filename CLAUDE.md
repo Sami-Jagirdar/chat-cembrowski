@@ -12,7 +12,8 @@ uv sync
 uv run -m chat_cembrowski.data.ingestion      # 1a. Fetch papers via SerpAPI Google Scholar
 uv run -m chat_cembrowski.data.ingestion ingest_local  # 1b. Create Paper objects from locally-sourced PDFs
 uv run -m chat_cembrowski.data.parser         # 2. Parse PDFs → markdown, store in data/json/
-uv run -m chat_cembrowski.data.vectordb       # 3. Chunk + embed + upsert to Qdrant
+uv run -m chat_cembrowski.data.image_extractor  # 3. Extract images → data/images/ + data/image_json/
+uv run -m chat_cembrowski.data.vectordb       # 4. Chunk + embed + upsert to Qdrant
 
 # Reset paper processed flags (before re-indexing)
 uv run scripts/reset_paper_processed.py
@@ -31,7 +32,8 @@ This is a RAG (Retrieval-Augmented Generation) system that answers questions abo
 src/chat_cembrowski/
   data/              # Data ingestion pipeline
     models.py        # Paper and Chunk dataclasses
-    ingestion.py     # SerpAPI fetch + local PDF bootstrap → creates Paper JSON objects
+    ingestion.py        # SerpAPI fetch + local PDF bootstrap → creates Paper JSON objects
+    image_extractor.py  # Extracts images per-page via fitz, finds captions, writes ImageRecord JSONs
     parser.py        # pymupdf4llm PDF → markdown, per-page extraction
     chunker.py       # LangChain RecursiveCharacterTextSplitter (1024 chars, 128 overlap)
     serialization.py # JSON read/write for Paper objects
