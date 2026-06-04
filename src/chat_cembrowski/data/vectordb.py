@@ -231,8 +231,8 @@ def embed_and_upsert(
 
 
 if __name__ == "__main__":
-    from .chunker import chunk_paper, chunk_paper_images
-    from .serialization import load_papers_from_json, save_paper
+    from .chunker import chunk_paper, chunk_paper_images, chunk_document
+    from .serialization import load_papers_from_json, save_paper, load_documents_from_json, save_document
 
     logging.basicConfig(level=logging.INFO)
 
@@ -242,6 +242,7 @@ if __name__ == "__main__":
 
     try:
         ensure_collection(client, recreate=False)
+
         for paper in load_papers_from_json():
             if paper.processed:
                 logger.info(
@@ -259,5 +260,18 @@ if __name__ == "__main__":
                 )
                 paper.processed = True
                 save_paper(paper)
+
+        for doc in load_documents_from_json():
+            if doc.processed:
+                logger.info(f"Document '{doc.title}' already processed — skipping.")
+                continue
+
+            chunks = chunk_document(doc)
+
+            if embed_and_upsert(client, vo, chunks, collection_name=collection_name) > 0:
+                logger.info(f"Embedded and upserted chunks for document '{doc.title}'.")
+                doc.processed = True
+                save_document(doc)
+
     finally:
         client.close()

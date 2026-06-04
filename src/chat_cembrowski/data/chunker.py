@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 
-from .models import Paper, Chunk, ImageRecord
+from .models import Paper, Chunk, ImageRecord, Document
 from .parser import preprocess_markdown, parse_pdf_for_pages
 from .serialization import load_paper, load_image_records_for_paper
 
@@ -297,6 +297,89 @@ def chunk_paper_images(
         )
 
     logger.info(f"Paper {paper.id} produced {len(chunks)} image chunks.")
+    return chunks
+
+
+# Maps Document.file_type → LangChain Language enum for code-aware splitting.
+# Unlisted types fall back to MARKDOWN (good general-purpose prose splitter).
+_CODE_LANGUAGE_MAP: dict[str, Language] = {
+    "py":   Language.PYTHON,
+    "js":   Language.JS,
+    "jsx":  Language.JS,
+    "ts":   Language.TS,
+    "tsx":  Language.TS,
+    "c":    Language.C,
+    "cpp":  Language.CPP,
+    "h":    Language.CPP,
+    "hpp":  Language.CPP,
+    "java": Language.JAVA,
+    "sol":  Language.SOL,
+    "md":   Language.MARKDOWN,
+}
+
+
+def _build_doc_embed_text(doc: Document, chunk_text: str) -> str:
+    """Prepend document title so the embedding carries provenance context."""
+    return f"Title: {doc.title}\n{chunk_text}"
+
+
+def _build_doc_payload(doc: Document, chunk_index: int, chunk_text: str) -> dict:
+    return {
+        "source_type": "document",
+        "chunk_category": "text",
+        "doc_id": doc.id,
+        "title": doc.title,
+        "file_type": doc.file_type,
+        "chunk_index": chunk_index,
+        "text": chunk_text,
+    }
+
+
+def chunk_document(doc: Document) -> list[Chunk]:
+    """Split a Document into overlapping chunks with metadata payload.
+
+    Code files are split with a language-aware splitter; prose and structured
+    files (txt, md, docx) use the markdown splitter which respects headings
+    and paragraph boundaries produced by the docx extractor.
+
+    Args:
+        doc: Document object with extracted text.
+
+    Returns:
+        List of Chunk objects ready for embedding and upsert.
+    """
+    if not doc.text or not doc.text.strip():
+        logger.warning(f"Document '{doc.title}' has empty text. Skipping.")
+        return []
+
+    language = _CODE_LANGUAGE_MAP.get(doc.file_type, Language.MARKDOWN)
+
+    text_splitter = RecursiveCharacterTextSplitter.from_language(
+        language=language,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+
+    try:
+        raw_chunks = text_splitter.split_text(doc.text)
+    except Exception as e:
+        logger.error(f"Error splitting document '{doc.title}': {e}")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, chunk_text in enumerate(raw_chunks):
+        chunk_text = chunk_text.strip()
+        if not chunk_text:
+            continue
+        chunks.append(
+            Chunk(
+                id=str(uuid.uuid4()),
+                text=_build_doc_embed_text(doc, chunk_text),
+                payload=_build_doc_payload(doc, i, chunk_text),
+            )
+        )
+
+    logger.info(f"Document '{doc.title}' split into {len(chunks)} chunks.")
     return chunks
 
 

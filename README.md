@@ -42,7 +42,7 @@ NOTE: In case you need to recreate chunks and embed them, run the following scri
 If you have a local group of general documents that you would like to add to the vector store, you can store them in data/docs (Note that the general docs ingestion only supports extracting and embedding *text*)
 Then the pipeline is as follows
 1. `uv run -m chat_cembrowski.data.doc_ingestion`
-
+2. `uv run -m chat_cembrowski.data.vectordb`
 
 ## Querying the System
 In scripts/ask.py, modify the questions you want to ask, then run it as follows:
