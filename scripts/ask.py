@@ -25,9 +25,10 @@ def main() -> None:
     )
 
     questions = [
-        "What are George Cembrowski's views on laboratory quality control?",
-        "What did Cembrowski publish about diagnostic testing errors?",
-        "How does Cembrowski discuss evidence-based laboratory medicine?",
+        "In the Kingston 3-year dual analyzer study, what does Figure 2 show about how inter-analyzer variation changes in the hours immediately following a cartridge replacement?",
+        "In the two-year Edmonton and Calgary hs-cTnT study, what mathematical method was used to separate the contributions of analytical, preanalytical, and biological variation from the sequential intrapatient troponin measurements?",
+        "How long should a blood gas analyzer cartridge be left running before its results can be considered reliable for sequential patient monitoring?",
+        "What is the practical clinical impact of using plasma separator tubes with gel (PST) versus Barricor tubes for high-sensitivity troponin testing in an emergency chest pain protocol?",
     ]
 
     for question in questions:
