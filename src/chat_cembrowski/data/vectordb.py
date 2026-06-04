@@ -102,7 +102,7 @@ def _batched(iterable, n: int) -> Iterator[list]:
 def _embed_text_batch(vo: voyageai.Client, chunks: list[Chunk]) -> list[list[float]]:
     """Embed a batch of text chunks via the Voyage multimodal endpoint."""
     result = vo.multimodal_embed(
-        inputs=[c.text for c in chunks],
+        inputs=[[c.text] for c in chunks],
         model=EMBEDDING_MODEL,
         input_type="document",
     )
