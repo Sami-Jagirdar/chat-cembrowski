@@ -43,6 +43,27 @@ class Chunk:
     }
 
 @dataclass
+class Document:
+    """Represents a miscellaneous context document (txt, docx, code file)."""
+    id: str
+    title: str
+    source_file: str    # filename in data/docs/
+    file_type: str      # "txt", "docx", "py", etc.
+    text: str = ""
+    processed: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "source_file": self.source_file,
+            "file_type": self.file_type,
+            "text": self.text,
+            "processed": self.processed,
+        }
+
+
+@dataclass
 class ImageRecord:
     """Represents an image extracted from a paper, with spatial and caption metadata."""
     id: str

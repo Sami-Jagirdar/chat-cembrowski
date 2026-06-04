@@ -40,6 +40,10 @@ wheels/
 data/vectors/collection/
 data/vectors/.lock
 
+# Keep only the placeholder in data/docs
+data/docs/*
+!data/docs/.gitkeep
+
 extras/
 notes
 claude_notes.md

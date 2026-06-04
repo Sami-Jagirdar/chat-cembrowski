@@ -28,6 +28,7 @@ To Create a Vector store of George Cembrowski's publications you have to run fet
 Run the following modules from the root of the repository
 
 1. `uv run -m chat_cembrowski.data.ingestion` (You will have to manually download pdfs only if they don't already exist, then place them in the data/papers folder and rename them as instructed)
+After this step, you can add additional pdf papers you may have gotten from other sources data/papers manuall if you want
 2. `uv run -m chat_cembrowski.data.parser`
 3. `uv run -m chat_cembrowski.data.image_extractor` 
 4. `uv run -m chat_cembrowski.data.vectordb`
@@ -37,18 +38,18 @@ After these steps you should have a collection in your qdrant cluster with all t
 NOTE: In case you need to recreate chunks and embed them, run the following script first
 `uv run scripts/reset_paper_processed.py`
 
+
+If you have a local group of general documents that you would like to add to the vector store, you can store them in data/docs (Note that the general docs ingestion only supports extracting and embedding *text*)
+Then the pipeline is as follows
+1. `uv run -m chat_cembrowski.data.doc_ingestion`
+
+
 ## Querying the System
 In scripts/ask.py, modify the questions you want to ask, then run it as follows:
 `uv run scripts/ask.py`
 
 # FUTURE STEPS
 - As of May 17, 2026, not doing metadata filtering for retrieval just for time's sake. Will be added very soon
-- Retrieving context from images as well in one of 2 ways:
--- Run the images extracted through a vision model to create detailed image captions with structural info, then add these to the chunks. (Similarly, we can even just use LlamaParse (paid) to parse both text and images in one shot to give us a single markdown to chunk)
--- We save the extracted images along with metadata separately, then search for relevant images during retrieval using the query and metadata. Then we include the images in the query to a multimodal model for retrieval.
 - Adding a reranker. Instead of just top 10, we do top 30, then a reranker model like bge-reranker can get top 10 from those
-- Currently page numbers stored in each chunk are simply based on pdf pages and not the actual article page numbers.
-For example, an article can be part of a journal and start at page 777 of that journal. So for accurate citations, we need those page numbers. One method is to parse and extract the page number from the first page of the article, then simply add it as an offset to all the page numbers stored in the chunks.
-
 
 
