@@ -42,11 +42,13 @@ class QueryEngine:
         openai_client: OpenAI,
         voyage_client: voyageai.Client, # type: ignore
         top_k: int = 10,
+        collection_name: str = COLLECTION_NAME,
     ) -> None:
         self.qdrant = qdrant_client
         self.openai = openai_client
         self.voyage = voyage_client
         self.top_k = top_k
+        self.collection_name = collection_name
 
     def query(self, question: str) -> str:
         """
@@ -98,7 +100,7 @@ Context:
 
     def _search(self, query_embedding: list[float]) -> list[RetrievedChunk]:
         results = self.qdrant.query_points(
-            collection_name=COLLECTION_NAME,
+            collection_name=self.collection_name,
             query=query_embedding,
             limit=self.top_k,
             with_payload=True,
