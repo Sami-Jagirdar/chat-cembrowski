@@ -1,9 +1,11 @@
+import argparse
 import logging
 
 from chat_cembrowski.data.vectordb import (
     get_openai_client,
     get_qdrant_client,
     get_voyage_client,
+    COLLECTION_NAME,
 )
 
 from chat_cembrowski.retrieval.query_engine import QueryEngine
@@ -13,6 +15,14 @@ logging.basicConfig(level=logging.INFO)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Query the RAG system.")
+    parser.add_argument(
+        "--collection",
+        default=COLLECTION_NAME,
+        help=f"Qdrant collection name to query (default: {COLLECTION_NAME}).",
+    )
+    args = parser.parse_args()
+
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
     voyage_client = get_voyage_client()
@@ -22,6 +32,7 @@ def main() -> None:
         openai_client=openai_client,
         voyage_client=voyage_client,
         top_k=10,
+        collection_name=args.collection,
     )
 
     questions = [

@@ -52,7 +52,13 @@ data/
 Run from the root of the repository in order:
 
 1. `uv run -m chat_cembrowski.data.ingestion`
-   Fetches paper metadata via SerpAPI Google Scholar. You may need to manually download some PDFs and place them in `data/papers/` as instructed by the script.
+   Fetches paper metadata via SerpAPI Google Scholar for the default author (George Cembrowski). You may need to manually download some PDFs and place them in `data/papers/` as instructed by the script.
+
+   Optional flags:
+   - `--author-id <ID>` — fetch papers for a different Google Scholar Author ID (default: `j8iA0kAAAAAJ`)
+   - `--num-articles <N>` — number of articles to fetch (default: `25`)
+
+   Example: `uv run -m chat_cembrowski.data.ingestion --author-id XYZ123 --num-articles 50`
 
 2. `uv run -m chat_cembrowski.data.ingestion ingest_local`
    Creates Paper objects for any PDFs in `data/papers/` not yet registered, extracting metadata from the first page via GPT-4.1-mini.
@@ -65,6 +71,9 @@ Run from the root of the repository in order:
 
 5. `uv run -m chat_cembrowski.data.vectordb`
    Chunks, embeds, and upserts everything to Qdrant.
+
+   Optional flag:
+   - `--collection <name>` — Qdrant collection name to upsert into (default: `cembrowski`)
 
 To re-index papers from scratch, reset the processed flag first:
 ```
@@ -85,10 +94,28 @@ Both steps are idempotent — already-processed files are skipped.
 
 ## Querying the System
 
+### Interactive CLI
+
+```
+uv run scripts/chat.py
+```
+
+Starts an interactive session. Type your question at the prompt; type `exit` or `quit` to stop.
+
+Optional flag:
+- `--collection <name>` — Qdrant collection to query (default: `cembrowski`)
+
+The CLI checks that the collection exists before starting and will list available collections if it doesn't.
+
+### Batch questions
+
 Edit the questions in `scripts/ask.py`, then run:
 ```
 uv run scripts/ask.py
 ```
+
+Optional flag:
+- `--collection <name>` — Qdrant collection to query (default: `cembrowski`)
 
 The system retrieves across papers, images, and documents in a single search. Citations are formatted by source type:
 - Papers: `[Title, Publication, p. X]`

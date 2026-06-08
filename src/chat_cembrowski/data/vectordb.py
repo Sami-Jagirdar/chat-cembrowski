@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-COLLECTION_NAME = "jenna_rimkus_papers"
+COLLECTION_NAME = "cembrowski"
 
 EMBEDDING_MODEL = "voyage-multimodal-3.5"
 VECTOR_DIM = 1024
@@ -73,33 +73,38 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def ensure_collection(client: QdrantClient, recreate: bool = False) -> None:
+def ensure_collection(
+    client: QdrantClient,
+    recreate: bool = False,
+    collection_name: str = COLLECTION_NAME,
+) -> None:
     """
     Create the collection if it doesn't exist.
 
     Args:
-        client:   Active QdrantClient.
-        recreate: If True, drop and recreate (required when changing VECTOR_DIM
-                  or switching embedding models).
+        client:          Active QdrantClient.
+        recreate:        If True, drop and recreate (required when changing VECTOR_DIM
+                         or switching embedding models).
+        collection_name: Qdrant collection name.
     """
-    exists = client.collection_exists(COLLECTION_NAME)
+    exists = client.collection_exists(collection_name)
 
     if exists and recreate:
-        logger.warning(f"Dropping existing collection '{COLLECTION_NAME}'.")
-        client.delete_collection(COLLECTION_NAME)
+        logger.warning(f"Dropping existing collection '{collection_name}'.")
+        client.delete_collection(collection_name)
         exists = False
 
     if not exists:
         client.create_collection(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
         )
         logger.info(
-            f"Created collection '{COLLECTION_NAME}' "
+            f"Created collection '{collection_name}' "
             f"(model={EMBEDDING_MODEL}, dim={VECTOR_DIM})."
         )
     else:
-        logger.info(f"Collection '{COLLECTION_NAME}' already exists — skipping creation.")
+        logger.info(f"Collection '{collection_name}' already exists — skipping creation.")
 
 
 def _batched(iterable, n: int) -> Iterator[list]:
@@ -241,17 +246,26 @@ def embed_and_upsert(
 
 
 if __name__ == "__main__":
+    import argparse
     from .chunker import chunk_paper, chunk_paper_images, chunk_document
     from .serialization import load_papers_from_json, save_paper, load_documents_from_json, save_document
 
     logging.basicConfig(level=logging.INFO)
 
+    parser = argparse.ArgumentParser(description="Embed and upsert chunks into Qdrant.")
+    parser.add_argument(
+        "--collection",
+        default=COLLECTION_NAME,
+        help=f"Qdrant collection name (default: {COLLECTION_NAME}).",
+    )
+    args = parser.parse_args()
+    collection_name = args.collection
+
     client = get_qdrant_client()
     vo = get_voyage_client()
-    collection_name = "jenna_rimkus_papers"  # change if you want to use a different collection
 
     try:
-        ensure_collection(client, recreate=False)
+        ensure_collection(client, recreate=False, collection_name=collection_name)
 
         for paper in load_papers_from_json():
             if paper.processed:

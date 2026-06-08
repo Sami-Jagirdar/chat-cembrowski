@@ -365,14 +365,39 @@ def ingest_local_pdfs(
 
 
 if __name__ == "__main__":
+    import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    # papers = fetch_author_papers()
-    papers = ingest_local_pdfs()
-    print(f"Fetched {len(papers)} papers for author ID {DEFAULT_AUTHOR_ID}.")
+    parser = argparse.ArgumentParser(description="Ingest research papers.")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=["ingest_local"],
+        help="Use 'ingest_local' to create Paper objects from locally-sourced PDFs.",
+    )
+    parser.add_argument(
+        "--author-id",
+        default=DEFAULT_AUTHOR_ID,
+        help=f"Google Scholar Author ID to fetch papers for (default: {DEFAULT_AUTHOR_ID}).",
+    )
+    parser.add_argument(
+        "--num-articles",
+        type=int,
+        default=25,
+        help="Number of articles to fetch (default: 25).",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "ingest_local":
+        papers = ingest_local_pdfs()
+        print(f"Ingested {len(papers)} papers from local PDFs.")
+    else:
+        papers = fetch_author_papers(author_id=args.author_id, num_articles=args.num_articles)
+        print(f"Fetched {len(papers)} papers for author ID {args.author_id}.")
 
     for paper in papers:
         print(f"- {paper.title} ({paper.source_file}, {len(paper.text)} characters)")
