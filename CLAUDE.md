@@ -25,7 +25,9 @@ uv run scripts/ask.py             # Edit questions in the file first
 
 ## Architecture
 
-This is a RAG (Retrieval-Augmented Generation) system that answers questions about George Cembrowski's research papers and related documents. It uses **Qdrant** for vector storage, **Voyage AI voyage-multimodal-3.5** (1024-dim) for embeddings, and **gpt-4.1-mini** for answer synthesis.
+This is a RAG (Retrieval-Augmented Generation) system that answers questions about George Cembrowski's research papers and related documents. It uses **Qdrant** for vector storage, **Voyage AI voyage-multimodal-3.5** (1024-dim) for embeddings, and **gpt-4.1** for answer synthesis (gpt-4.1-mini for query classification/routing).
+
+General medical questions that fall outside Cembrowski's corpus are routed to NIH/NLM sources (MedlinePlus + PubMed) instead of the Cembrowski papers — see "Query routing" below.
 
 ### Package layout
 
@@ -41,8 +43,9 @@ src/chat_cembrowski/
     serialization.py # JSON read/write for Paper and Document objects
     vectordb.py      # Qdrant client, Voyage AI embedding, batch upsert
   retrieval/         # Query interface
-    query_engine.py  # Embed → search Qdrant → build context → generate with GPT-4.1-mini
-    prompts.py       # System prompt with citation formatting rules
+    query_engine.py  # Classify → route to Cembrowski (Qdrant) or NIH → build context → generate with GPT-4.1
+    prompts.py       # System prompts (Cembrowski, NIH) + classifier prompt + citation formatting rules
+    nih.py           # MedlinePlus + PubMed (NCBI E-utilities) search clients for general medical questions
 scripts/
   ask.py                    # CLI entry point for asking questions
   reset_paper_processed.py  # Resets Paper.processed to False
@@ -84,6 +87,7 @@ All points share `chunk_category` ("text" or "image"), `chunk_index`, and `text`
 
 ### QueryEngine
 
+- `query(question)` returns a plain answer string; `query_with_route(question)` returns `(answer, route)` where `route` is `"cembrowski"` or `"nih"`, for callers that want to label/disclaim NIH answers in the UI.
 - Embeds the question via Voyage AI `multimodal_embed` with `input_type="query"`
 - Searches Qdrant for top-10 chunks (`query_points`)
 - Routes retrieved points by `chunk_category` (image) and `source_type` (document vs paper)
@@ -91,7 +95,22 @@ All points share `chunk_category` ("text" or "image"), `chunk_index`, and `text`
   - Papers: `[Title, Publication, p. X]`
   - Images: `[Title, Publication, p. X, fig.]`
   - Documents: `[Title]`
-- Calls `gpt-4.1-mini` with a system prompt enforcing ground-in-context answers
+- Calls `gpt-4.1` with a system prompt enforcing ground-in-context answers
+
+### Query routing (Cembrowski vs. NIH)
+
+Non-technical site visitors may ask general medical questions unrelated to Cembrowski's own research; per the client's direction, those are answered from NIH sources instead of being refused.
+
+`QueryEngine.query_with_route()` decides per-question:
+1. **Classify** — a cheap `gpt-4.1-mini` call (`_classify`, prompt in `prompts.CLASSIFIER_PROMPT`) labels the question `"cembrowski"` or `"general"`. Defaults to `"cembrowski"` on API failure.
+2. **Retrieve + score-check** — if labeled `"cembrowski"`, the question is embedded and searched against Qdrant as usual. The top hit's cosine score must clear `SCORE_THRESHOLD` (0.4, in `query_engine.py`) to be trusted; this catches questions that were misclassified or simply aren't covered by the corpus.
+3. **Route** — a strong Cembrowski match is answered via `_answer_cembrowski` (existing `SYSTEM_PROMPT`, cites Cembrowski's papers/documents/images). Everything else — `"general"`-labeled questions, or weak/no Cembrowski matches — is answered via `_answer_nih`.
+
+`_answer_nih` calls `nih.search_nih(question)` (`src/chat_cembrowski/retrieval/nih.py`), which queries:
+- **MedlinePlus Web Service** (`wsearch.nlm.nih.gov`) — primary source; plain-language consumer health topics, no API key needed.
+- **PubMed via NCBI E-utilities** (`esearch`/`efetch`) — supplementary fallback when MedlinePlus returns few/no results; technical literature abstracts. Optional `NCBI_API_KEY` / `NCBI_EMAIL` env vars raise the free rate limit (3→10 req/sec) and follow NCBI etiquette, but both services work without any key.
+
+Results are rendered into a context block (`_build_nih_context`, same `SOURCE {i}` format as the Cembrowski path) and answered with a separate `NIH_SYSTEM_PROMPT` (in `prompts.py`) that requires plain language, `[MedlinePlus: Title](url)` / `[PubMed: Title](url)` citations, and a not-medical-advice disclaimer — kept deliberately distinct from `SYSTEM_PROMPT` so NIH answers are never confused with Cembrowski's own research findings. Network failures in `nih.py` return `[]` rather than raising, so `_answer_nih` degrades to a graceful "couldn't find NIH information" message instead of crashing the request.
 
 ### Page number note
 

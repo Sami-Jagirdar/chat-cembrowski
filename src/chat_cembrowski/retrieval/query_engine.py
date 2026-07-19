@@ -11,10 +11,18 @@ from chat_cembrowski.data.vectordb import (
     EMBEDDING_MODEL,
 )
 
-from .prompts import SYSTEM_PROMPT
+from . import nih
+from .nih import NIHResult
+from .prompts import CLASSIFIER_PROMPT, NIH_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 
 CHAT_MODEL = "gpt-4.1"
+CLASSIFIER_MODEL = "gpt-4.1-mini"
+
+# Minimum top-hit Qdrant cosine score to trust the Cembrowski corpus for a
+# question classified as Cembrowski-specific. Below this, retrieval is too
+# weak to be reliable, so the question is routed to NIH instead.
+SCORE_THRESHOLD = 0.4
 
 
 @dataclass
@@ -51,20 +59,68 @@ class QueryEngine:
         self.collection_name = collection_name
 
     def query(self, question: str) -> str:
+        """End-to-end RAG query pipeline. See `query_with_route` for details."""
+        answer, _route = self.query_with_route(question)
+        return answer
+
+    def query_with_route(self, question: str) -> tuple[str, str]:
         """
-        End-to-end RAG query pipeline.
+        End-to-end RAG query pipeline with source routing.
 
         Steps:
-        1. Embed query
-        2. Retrieve top-k chunks from Qdrant
-        3. Build grounded prompt
-        4. Generate answer
+        1. Classify the question as "cembrowski" or "general" (cheap LLM call).
+        2. If "cembrowski": embed + search Qdrant. If the top hit clears
+           SCORE_THRESHOLD, answer from the Cembrowski corpus.
+        3. Otherwise (classified "general", or Cembrowski retrieval was too
+           weak to trust): answer from NIH (MedlinePlus + PubMed).
+
+        Returns:
+            (answer, route) where route is "cembrowski" or "nih".
         """
-        query_embedding = self._embed_query(question)
+        label = self._classify(question)
 
-        retrieved_chunks = self._search(query_embedding)
+        if label != "general":
+            query_embedding = self._embed_query(question)
+            retrieved_chunks = self._search(query_embedding)
 
-        context = self._build_context(retrieved_chunks)
+            strong_match = (
+                bool(retrieved_chunks)
+                and retrieved_chunks[0].score >= SCORE_THRESHOLD
+            )
+            if strong_match:
+                return self._answer_cembrowski(question, retrieved_chunks), "cembrowski"
+
+        return self._answer_nih(question), "nih"
+
+    def _classify(self, question: str) -> str:
+        """
+        Classify a question as "cembrowski" or "general" via a cheap LLM call.
+
+        Defaults to "cembrowski" on any API failure — the retrieval-score
+        check in `query_with_route` still catches weak/off-topic matches and
+        routes them to NIH, so failing open here doesn't bypass the fallback.
+        """
+        try:
+            response = self.openai.chat.completions.create(
+                model=CLASSIFIER_MODEL,
+                temperature=0,
+                max_tokens=5,
+                messages=[
+                    {"role": "system", "content": CLASSIFIER_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+            )
+            label = (response.choices[0].message.content or "").strip().lower()
+        except Exception:
+            return "cembrowski"
+
+        return "general" if "general" in label else "cembrowski"
+
+    def _answer_cembrowski(
+        self, question: str, chunks: list[RetrievedChunk]
+    ) -> str:
+        """Build a grounded prompt from Cembrowski corpus chunks and generate an answer."""
+        context = self._build_context(chunks)
 
         response = self.openai.chat.completions.create(
             model=CHAT_MODEL,
@@ -74,6 +130,65 @@ class QueryEngine:
                 {
                     "role": "system",
                     "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": f"""
+Question:
+{question}
+
+Context:
+{context}
+""",
+                },
+            ],
+        )
+
+        return response.choices[0].message.content or ""
+
+    def _search_nih(self, question: str) -> list[NIHResult]:
+        return nih.search_nih(question)
+
+    def _build_nih_context(self, results: list[NIHResult]) -> str:
+        """Build retrieval context for the LLM from NIH (MedlinePlus/PubMed) results."""
+        sections = []
+
+        for i, result in enumerate(results, start=1):
+            header_lines = [f"Source: {result.source}", f"Title: {result.title}"]
+            if result.journal:
+                header_lines.append(f"Journal: {result.journal}")
+            if result.year:
+                header_lines.append(f"Year: {result.year}")
+            header_lines.append(f"URL: {result.url}")
+            header = "\n".join(header_lines)
+            body = result.summary or "(no summary available)"
+
+            sections.append(f"SOURCE {i}\n\n{header}\n\nContent:\n{body}")
+
+        return "\n\n====================\n\n".join(sections)
+
+    def _answer_nih(self, question: str) -> str:
+        """Answer a general medical question from NIH (MedlinePlus/PubMed) search results."""
+        results = self._search_nih(question)
+
+        if not results:
+            return (
+                "I couldn't find reliable NIH information to answer this "
+                "question. Please try rephrasing, or consult a healthcare "
+                "professional.\n\n"
+                "This is general information, not medical advice."
+            )
+
+        context = self._build_nih_context(results)
+
+        response = self.openai.chat.completions.create(
+            model=CHAT_MODEL,
+            temperature=0.1,
+            max_tokens=1500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": NIH_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
