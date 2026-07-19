@@ -31,10 +31,13 @@ EMBEDDING_DIMENSIONS = VECTOR_DIM  # alias for query_engine compatibility
 
 TEXT_BATCH_SIZE = 64
 IMAGE_BATCH_SIZE = 16    # images are token-heavier; keep batches smaller
+PAGE_BATCH_SIZE = 8      # full-page renders are heavier still than cropped figures
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 QDRANT_LOCAL_PATH = PROJECT_ROOT / "data" / "vectors"
 IMAGES_DIR = PROJECT_ROOT / "data" / "images"
+PAGE_IMAGES_DIR = PROJECT_ROOT / "data" / "page_images"
+PAGE_RENDER_ZOOM = 2.0   # ~144 DPI; see parser.DEFAULT_PAGE_RENDER_ZOOM
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -184,20 +187,28 @@ def embed_and_upsert(
     chunks: list[Chunk],
     images_dir: Path = IMAGES_DIR,
     collection_name: str = COLLECTION_NAME,
+    image_batch_size: int = IMAGE_BATCH_SIZE,
 ) -> int:
     """
     Embed and upsert a mixed list of text and image Chunk objects into Qdrant.
 
     Routes by chunk_category: text chunks are embedded as plain text; image
     chunks are embedded as (text, image) pairs using the Voyage multimodal model.
+    This also covers full-page chunks from chunk_paper_pages() — they carry
+    chunk_category="image" and a rendered page PNG as their source_file.
 
     Args:
         client:     Active QdrantClient.
         vo:         Active Voyage AI client.
-        chunks:     Output of chunk_paper() + chunk_paper_images() for one or
-                    more papers.
-        images_dir: Directory containing extracted image files.
+        chunks:     Output of chunk_paper() + chunk_paper_images(), or
+                    chunk_paper_pages(), for one or more papers.
+        images_dir: Directory containing the image files referenced by
+                    image-category chunks' source_file (extracted figures or
+                    rendered page PNGs, depending on chunking strategy).
         collection_name: Qdrant collection to upsert into.
+        image_batch_size: Batch size for image-category chunks. Full-page
+                    renders are token-heavier than cropped figures, so callers
+                    embedding pages should pass a smaller value (e.g. PAGE_BATCH_SIZE).
 
     Returns:
         Total number of points successfully upserted.
@@ -225,7 +236,7 @@ def embed_and_upsert(
         except Exception as e:
             logger.error(f"Qdrant upsert failed (text batch): {e}")
 
-    for batch in _batched(image_chunks, IMAGE_BATCH_SIZE):
+    for batch in _batched(image_chunks, image_batch_size):
         try:
             valid_chunks, embeddings = _embed_image_batch(vo, batch, images_dir)
         except Exception as e:
@@ -247,7 +258,7 @@ def embed_and_upsert(
 
 if __name__ == "__main__":
     import argparse
-    from .chunker import chunk_paper, chunk_paper_images, chunk_document
+    from .chunker import chunk_paper, chunk_paper_images, chunk_paper_pages, chunk_document
     from .serialization import load_papers_from_json, save_paper, load_documents_from_json, save_document
 
     logging.basicConfig(level=logging.INFO)
@@ -257,6 +268,25 @@ if __name__ == "__main__":
         "--collection",
         default=COLLECTION_NAME,
         help=f"Qdrant collection name (default: {COLLECTION_NAME}).",
+    )
+    parser.add_argument(
+        "--method",
+        choices=["page", "split"],
+        default="page",
+        help=(
+            "Chunking strategy: 'page' (default, primary) renders each PDF page "
+            "as a full image paired with its markdown text; 'split' uses the "
+            "original strategy of separate text chunks + cropped figure chunks."
+        ),
+    )
+    parser.add_argument(
+        "--zoom",
+        type=float,
+        default=PAGE_RENDER_ZOOM,
+        help=(
+            f"Render scale factor (72 DPI * zoom) for --method page "
+            f"(default: {PAGE_RENDER_ZOOM})."
+        ),
     )
     args = parser.parse_args()
     collection_name = args.collection
@@ -275,9 +305,14 @@ if __name__ == "__main__":
                 )
                 continue
 
-            chunks = chunk_paper(paper) + chunk_paper_images(paper)
+            if args.method == "page":
+                chunks = chunk_paper_pages(paper, PAGE_IMAGES_DIR, zoom=args.zoom)
+                upsert_kwargs = dict(images_dir=PAGE_IMAGES_DIR, image_batch_size=PAGE_BATCH_SIZE)
+            else:
+                chunks = chunk_paper(paper) + chunk_paper_images(paper)
+                upsert_kwargs = dict(images_dir=IMAGES_DIR)
 
-            if embed_and_upsert(client, vo, chunks, collection_name=collection_name) > 0:
+            if embed_and_upsert(client, vo, chunks, collection_name=collection_name, **upsert_kwargs) > 0:
                 logger.info(
                     f"Embedded and upserted chunks for paper "
                     f"'{paper.title}' (ID: {paper.id}).\n"

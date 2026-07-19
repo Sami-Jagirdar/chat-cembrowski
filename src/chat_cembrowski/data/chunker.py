@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 from .models import Paper, Chunk, ImageRecord, Document
-from .parser import preprocess_markdown, parse_pdf_for_pages
+from .parser import preprocess_markdown, parse_pdf_for_pages, render_pdf_pages_as_images, DEFAULT_PAGE_RENDER_ZOOM
 from .serialization import load_paper, load_image_records_for_paper
 
 
@@ -25,6 +25,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
 IMAGE_JSON_DIR = PROJECT_ROOT / "data/image_json"
+PAGE_IMAGES_DIR = PROJECT_ROOT / "data/page_images"
+
+# Fixed namespace for deriving deterministic page-chunk IDs (uuid5), so
+# re-running chunk_paper_pages() on the same paper yields the same point IDs
+# and upserts overwrite in place rather than duplicating.
+PAGE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.page_chunks")
 
 def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: int, page_end: int) -> dict:
     """
@@ -297,6 +303,120 @@ def chunk_paper_images(
         )
 
     logger.info(f"Paper {paper.id} produced {len(chunks)} image chunks.")
+    return chunks
+
+
+def _build_page_embed_text(paper: Paper, page_text: str) -> str:
+    """
+    Compose the text input sent to Voyage alongside the full-page image.
+    Paper metadata anchors provenance; the page's own markdown carries the
+    text Voyage can't read directly off the rendered image.
+    """
+    parts: list[str] = []
+    if paper.title:
+        parts.append(f"Title: {paper.title}")
+    if paper.year:
+        parts.append(f"Year: {paper.year}")
+    if paper.publication:
+        parts.append(f"Publication: {paper.publication}")
+    if page_text:
+        parts.append(page_text)
+    return "\n".join(parts)
+
+
+def _build_page_payload(
+    paper: Paper,
+    chunk_index: int,
+    page_text: str,
+    source_file: str,
+    journal_page: int,
+) -> dict:
+    """
+    Payload for a whole-page image chunk. Reuses the image chunk_category so
+    it flows through the existing multimodal embed/retrieval paths; image_type
+    "page" (as opposed to "figure"/"table"/etc.) distinguishes it from cropped
+    figure chunks produced by chunk_paper_images(). `text` carries the page's
+    markdown so it can stand in as LLM context at query time.
+    """
+    return {
+        "chunk_category": "image",
+        "image_type": "page",
+        "paper_id": paper.id,
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "publication": paper.publication,
+        "chunk_index": chunk_index,
+        "page": journal_page,
+        "page_label": f"p. {journal_page}",
+        "source_file": source_file,
+        "bbox": None,  # whole page, not a crop
+        "caption": None,
+        "text": page_text,
+    }
+
+
+def chunk_paper_pages(
+    paper: Paper,
+    page_images_dir: Path = PAGE_IMAGES_DIR,
+    zoom: float = DEFAULT_PAGE_RENDER_ZOOM,
+) -> list[Chunk]:
+    """
+    Render every PDF page as a full-page image and pair it with that page's
+    markdown text, producing one multimodal Chunk per page.
+
+    This is the primary chunking strategy: rather than embedding parsed text
+    and cropped figures as separate chunks, each page's full visual layout
+    (body text, figures, tables, formatting) is embedded as a single image
+    alongside its markdown, so retrieval can surface a page as a whole unit.
+
+    Args:
+        paper: Paper object containing source_file path and metadata.
+        page_images_dir: Directory to render page PNGs into.
+        zoom: Render scale factor (72 DPI * zoom) passed to render_pdf_pages_as_images.
+
+    Returns:
+        List of Chunk objects; each payload includes page/page_label and the
+        rendered PNG filename (source_file) for the multimodal embed step.
+    """
+    pdf_path = DATA_DIR / paper.source_file
+
+    pages = parse_pdf_for_pages(pdf_path)
+    if not pages:
+        logger.warning(f"Paper {paper.id} yielded no page text. Skipping page chunking.")
+        return []
+
+    text_by_page = {p["page"]: preprocess_markdown(p["text"]) for p in pages}
+
+    # journal_page = pdf_page + page_offset (same anchoring as chunk_paper / image_extractor)
+    page_offset = (
+        paper.first_page_number - pages[0]["page"]
+        if paper.first_page_number is not None
+        else 0
+    )
+
+    rendered = render_pdf_pages_as_images(pdf_path, page_images_dir, paper.id, zoom=zoom)
+    if not rendered:
+        logger.warning(f"Paper {paper.id} yielded no rendered page images. Skipping page chunking.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, page_info in enumerate(rendered):
+        pdf_page_num = page_info["page"]
+        page_text = text_by_page.get(pdf_page_num, "")
+        journal_page = pdf_page_num + page_offset
+
+        chunks.append(
+            Chunk(
+                id=str(uuid.uuid5(PAGE_ID_NAMESPACE, f"{paper.id}:page:{pdf_page_num}")),
+                text=_build_page_embed_text(paper, page_text),
+                payload=_build_page_payload(
+                    paper, i, page_text, page_info["image_file"], journal_page
+                ),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} page chunks.")
     return chunks
 
 

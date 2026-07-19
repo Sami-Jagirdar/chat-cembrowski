@@ -5,6 +5,7 @@ This module provides functions to parse PDF files, extract text as markdown, cle
 import re
 from typing import Any, Dict, List
 import pymupdf4llm
+import fitz
 from pathlib import Path
 import logging
 import json
@@ -13,6 +14,16 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
+
+DEFAULT_PAGE_RENDER_ZOOM = 2.0  # ~144 DPI (72 * zoom); higher = sharper text, more tokens
+
+# Voyage multimodal embeddings reject images over 16 million pixels. Some
+# source PDFs are physically large (e.g. conference posters), so a fixed
+# zoom can blow past that on a per-page basis. We clamp per-page instead of
+# lowering the global default, so normal-sized pages still render at the
+# full requested zoom.
+MAX_PAGE_IMAGE_PIXELS = 16_000_000
+PAGE_IMAGE_PIXEL_SAFETY_MARGIN = 0.95  # stay safely under the cap after integer pixel rounding
 
 def _parse_pdf_for_text(pdf_path: Path) -> str | List[Dict[str, Any]]:
     """
@@ -75,6 +86,75 @@ def parse_pdf_for_pages(pdf_path: Path) -> list[dict]:
     except Exception as e:
         logger.error(f"Error parsing {pdf_path}: {e}")
         return []
+
+
+def render_pdf_pages_as_images(
+    pdf_path: Path,
+    out_dir: Path,
+    paper_id: str,
+    zoom: float = DEFAULT_PAGE_RENDER_ZOOM,
+) -> list[dict]:
+    """
+    Render every page of a PDF to a standalone PNG image.
+
+    Used by the page-based multimodal chunking strategy, where each page's
+    full visual layout (text, figures, tables) is embedded as a single image
+    alongside the page's markdown text.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        out_dir: Directory to write rendered PNGs into (created if missing).
+        paper_id: Paper ID, used to build a unique, stable filename per page.
+        zoom: Render scale factor applied to both axes (72 DPI * zoom).
+              2.0 (~144 DPI) balances text legibility against embedding cost.
+
+    Returns:
+        List of dicts with keys: 'page' (1-based int), 'image_file' (str
+        filename, relative to out_dir). Empty list if rendering fails.
+    """
+    try:
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            logger.error(f"PDF file not found: {pdf_path}")
+            return []
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        doc = fitz.open(str(pdf_path))
+        max_pixels = MAX_PAGE_IMAGE_PIXELS * PAGE_IMAGE_PIXEL_SAFETY_MARGIN
+
+        pages: list[dict] = []
+        for page in doc:
+            page_number = page.number + 1  # 1-based
+            filename = f"{paper_id}_p{page_number}.png"
+
+            # Clamp zoom per-page so oversized physical pages (e.g. posters)
+            # still fit under Voyage's pixel budget.
+            rect = page.rect
+            page_area = rect.width * rect.height
+            effective_zoom = zoom
+            if page_area > 0:
+                requested_pixels = page_area * (zoom ** 2)
+                if requested_pixels > max_pixels:
+                    effective_zoom = (max_pixels / page_area) ** 0.5
+                    logger.warning(
+                        f"{pdf_path.name} page {page_number} is oversized for "
+                        f"zoom={zoom} ({requested_pixels:,.0f} px); "
+                        f"clamping to zoom={effective_zoom:.3f}."
+                    )
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(effective_zoom, effective_zoom))
+            pix.save(str(out_dir / filename))
+            pages.append({"page": page_number, "image_file": filename})
+
+        logger.info(f"Rendered {len(pages)} page images for {pdf_path.name}")
+        return pages
+
+    except Exception as e:
+        logger.error(f"Error rendering pages for {pdf_path}: {e}")
+        return []
+
 
 def preprocess_markdown(text: str) -> str:
     """
