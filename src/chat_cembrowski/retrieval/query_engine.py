@@ -13,8 +13,11 @@ from chat_cembrowski.data.vectordb import (
 
 from . import nih
 from .nih import NIHResult
-from .prompts import CLASSIFIER_PROMPT, NIH_SYSTEM_PROMPT, SYSTEM_PROMPT
+from .prompts import CLASSIFIER_PROMPT, CONDENSE_PROMPT, NIH_SYSTEM_PROMPT, SYSTEM_PROMPT
 
+# A single prior turn: {"role": "user" | "assistant", "content": str}. Already
+# the OpenAI message shape, so it drops straight into a `messages` list.
+ChatMessage = dict[str, str]
 
 CHAT_MODEL = "gpt-4.1"
 CLASSIFIER_MODEL = "gpt-4.1-mini"
@@ -58,29 +61,47 @@ class QueryEngine:
         self.top_k = top_k
         self.collection_name = collection_name
 
-    def query(self, question: str) -> str:
+    def query(
+        self, question: str, history: list[ChatMessage] | None = None
+    ) -> str:
         """End-to-end RAG query pipeline. See `query_with_route` for details."""
-        answer, _route = self.query_with_route(question)
+        answer, _route = self.query_with_route(question, history)
         return answer
 
-    def query_with_route(self, question: str) -> tuple[str, str]:
+    def query_with_route(
+        self, question: str, history: list[ChatMessage] | None = None
+    ) -> tuple[str, str]:
         """
         End-to-end RAG query pipeline with source routing.
 
         Steps:
-        1. Classify the question as "cembrowski" or "general" (cheap LLM call).
+        0. If there's prior conversation, condense the follow-up into a
+           standalone question (cheap LLM call) — used for classification,
+           embedding, and search so context-dependent follow-ups (e.g. "what
+           about in women?") still retrieve correctly.
+        1. Classify the (standalone) question as "cembrowski" or "general"
+           (cheap LLM call).
         2. If "cembrowski": embed + search Qdrant. If the top hit clears
            SCORE_THRESHOLD, answer from the Cembrowski corpus.
         3. Otherwise (classified "general", or Cembrowski retrieval was too
            weak to trust): answer from NIH (MedlinePlus + PubMed).
 
+        The raw `question` (plus `history`) is what's sent to the model for
+        answer generation, so phrasing and tone stay natural; only retrieval
+        and routing operate on the condensed standalone version.
+
         Returns:
             (answer, route) where route is "cembrowski" or "nih".
         """
-        label = self._classify(question)
+        history = history or []
+        search_question = (
+            self._condense_question(question, history) if history else question
+        )
+
+        label = self._classify(search_question)
 
         if label != "general":
-            query_embedding = self._embed_query(question)
+            query_embedding = self._embed_query(search_question)
             retrieved_chunks = self._search(query_embedding)
 
             strong_match = (
@@ -88,9 +109,45 @@ class QueryEngine:
                 and retrieved_chunks[0].score >= SCORE_THRESHOLD
             )
             if strong_match:
-                return self._answer_cembrowski(question, retrieved_chunks), "cembrowski"
+                return (
+                    self._answer_cembrowski(question, retrieved_chunks, history),
+                    "cembrowski",
+                )
 
-        return self._answer_nih(question), "nih"
+        return self._answer_nih(question, history, search_question), "nih"
+
+    def _condense_question(
+        self, question: str, history: list[ChatMessage]
+    ) -> str:
+        """
+        Rewrite a follow-up question as a standalone question using the prior
+        conversation (cheap LLM call). Used only to drive classification,
+        embedding, and search — the original `question` is still what gets
+        answered.
+
+        Falls back to the raw question on any API failure or empty response,
+        so a condensation hiccup degrades to today's stateless behavior rather
+        than breaking the request.
+        """
+        try:
+            response = self.openai.chat.completions.create(
+                model=CLASSIFIER_MODEL,
+                temperature=0,
+                max_tokens=256,
+                messages=[
+                    {"role": "system", "content": CONDENSE_PROMPT},
+                    *history, # type: ignore
+                    {
+                        "role": "user",
+                        "content": f"Follow-up question: {question}\n\nStandalone question:",
+                    },
+                ],
+            )
+            standalone = (response.choices[0].message.content or "").strip()
+        except Exception:
+            return question
+
+        return standalone or question
 
     def _classify(self, question: str) -> str:
         """
@@ -117,7 +174,10 @@ class QueryEngine:
         return "general" if "general" in label else "cembrowski"
 
     def _answer_cembrowski(
-        self, question: str, chunks: list[RetrievedChunk]
+        self,
+        question: str,
+        chunks: list[RetrievedChunk],
+        history: list[ChatMessage] | None = None,
     ) -> str:
         """Build a grounded prompt from Cembrowski corpus chunks and generate an answer."""
         context = self._build_context(chunks)
@@ -131,6 +191,7 @@ class QueryEngine:
                     "role": "system",
                     "content": SYSTEM_PROMPT,
                 },
+                *(history or []), # type: ignore
                 {
                     "role": "user",
                     "content": f"""
@@ -167,9 +228,14 @@ Context:
 
         return "\n\n====================\n\n".join(sections)
 
-    def _answer_nih(self, question: str) -> str:
+    def _answer_nih(
+        self,
+        question: str,
+        history: list[ChatMessage] | None = None,
+        search_question: str | None = None,
+    ) -> str:
         """Answer a general medical question from NIH (MedlinePlus/PubMed) search results."""
-        results = self._search_nih(question)
+        results = self._search_nih(search_question or question)
 
         if not results:
             return (
@@ -190,6 +256,7 @@ Context:
                     "role": "system",
                     "content": NIH_SYSTEM_PROMPT,
                 },
+                *(history or []), # type: ignore
                 {
                     "role": "user",
                     "content": f"""

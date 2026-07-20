@@ -29,6 +29,18 @@ Read the question and respond with exactly one word: "cembrowski" or
 "general". No punctuation, no explanation.
 """
 
+CONDENSE_PROMPT = """
+Given the conversation so far and a follow-up question, rewrite the follow-up
+as a standalone question that can be understood on its own.
+
+Rules:
+1. Resolve references ("it", "that figure", "the same in women?") using the
+   conversation.
+2. If the follow-up is already standalone, return it unchanged.
+3. Do NOT answer it. Return ONLY the rewritten question text, nothing else.
+4. Do not add information that isn't implied by the conversation.
+"""
+
 NIH_SYSTEM_PROMPT = """
 You are a health information assistant answering general medical questions for
 a non-technical, general-public audience, using search results from NIH/NLM

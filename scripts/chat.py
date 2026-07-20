@@ -42,6 +42,11 @@ def main() -> None:
 
     print(f"Connected to collection '{args.collection}'. Type 'exit' or 'quit' to stop.\n")
 
+    # Last 4 exchanges (8 messages), matching the window used by the frontend
+    # and backend, so this REPL exercises multi-turn the same way production does.
+    history_window = 8
+    history: list[dict[str, str]] = []
+
     while True:
         try:
             question = input("You: ").strip()
@@ -56,8 +61,12 @@ def main() -> None:
             print("Exiting.")
             break
 
-        answer = engine.query(question)
+        answer = engine.query(question, history)
         print(f"\nAssistant: {answer}\n")
+
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": answer})
+        history = history[-history_window:]
 
 
 if __name__ == "__main__":
