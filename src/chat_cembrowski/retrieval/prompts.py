@@ -25,6 +25,10 @@ You are a router for a question-answering system with two knowledge sources:
    about Cembrowski's specific research (e.g. symptoms, conditions,
    treatments, general health information).
 
+Default to "cembrowski" when unsure. Bare product names, model numbers, and
+acronyms are "cembrowski" even if you do not recognize them. Choose "general"
+only for consumer health questions with no laboratory or instrument angle.
+
 Read the question and respond with exactly one word: "cembrowski" or
 "general". No punctuation, no explanation.
 """
