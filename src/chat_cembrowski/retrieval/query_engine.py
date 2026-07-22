@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import voyageai
 from openai import OpenAI
@@ -48,11 +48,59 @@ class RetrievedChunk:
     publication: str | None = None
     year: int | None = None
     page_label: str | None = None
+    authors: list[str] | None = None
+    page: int | None = None
+    # Set by scripts/link_posters.py — ties a poster chunk to its page on the
+    # website. Absent on chunks that predate the backfill, so always optional.
+    site_path: str | None = None    # e.g. "/presentation/gem-4000-cartridge-instability"
+    poster_id: str | None = None    # e.g. "pos-gem-4000-cartridge-instability"
     # Document-specific
     file_type: str | None = None
     # Image-specific
     caption: str | None = None
     image_type: str | None = None
+
+
+@dataclass
+class SourceRef:
+    """
+    One entry in a numbered source list, aligned by position with the
+    `SOURCE {i}` blocks handed to the model. `index` is 1-based and is what the
+    model cites as `[index]`.
+
+    `kind` is "poster" (Cembrowski research with a page on the site),
+    "document" (an internal note/code file, no public page), or "nih"
+    (MedlinePlus/PubMed). `url` is a site-relative path for posters, an absolute
+    URL for NIH, and None for documents.
+    """
+    index: int
+    kind: str
+    title: str
+    authors: list[str] = field(default_factory=list)
+    url: str | None = None
+    page: int | None = None
+    publication: str | None = None
+    year: int | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "kind": self.kind,
+            "title": self.title,
+            "authors": self.authors,
+            "url": self.url,
+            "page": self.page,
+            "publication": self.publication,
+            "year": self.year,
+        }
+
+
+@dataclass
+class QueryResult:
+    """Answer plus the ordered sources it was grounded in and the route taken."""
+    answer: str
+    route: str              # "cembrowski" or "nih"
+    sources: list[SourceRef] = field(default_factory=list)
 
 
 class QueryEngine:
@@ -73,15 +121,26 @@ class QueryEngine:
     def query(
         self, question: str, history: list[ChatMessage] | None = None
     ) -> str:
-        """End-to-end RAG query pipeline. See `query_with_route` for details."""
-        answer, _route = self.query_with_route(question, history)
-        return answer
+        """End-to-end RAG query pipeline. See `query_structured` for details."""
+        return self.query_structured(question, history).answer
 
     def query_with_route(
         self, question: str, history: list[ChatMessage] | None = None
     ) -> tuple[str, str]:
         """
-        End-to-end RAG query pipeline with source routing.
+        End-to-end RAG query pipeline, returning `(answer, route)`.
+
+        Thin wrapper over `query_structured` for callers that want the route
+        label but not the source list. See `query_structured` for the steps.
+        """
+        result = self.query_structured(question, history)
+        return result.answer, result.route
+
+    def query_structured(
+        self, question: str, history: list[ChatMessage] | None = None
+    ) -> QueryResult:
+        """
+        End-to-end RAG query pipeline with source routing and structured sources.
 
         Steps:
         0. If there's prior conversation, condense the follow-up into a
@@ -99,8 +158,9 @@ class QueryEngine:
         answer generation, so phrasing and tone stay natural; only retrieval
         and routing operate on the condensed standalone version.
 
-        Returns:
-            (answer, route) where route is "cembrowski" or "nih".
+        Returns a QueryResult whose `sources` are 1-based and aligned by
+        position with the `SOURCE {i}` blocks the model was shown, so a `[i]`
+        citation in the answer maps straight to `sources[i - 1]`.
         """
         history = history or []
         search_question = (
@@ -118,12 +178,13 @@ class QueryEngine:
                 and retrieved_chunks[0].score >= SCORE_THRESHOLD
             )
             if strong_match:
-                return (
-                    self._answer_cembrowski(question, retrieved_chunks, history),
-                    "cembrowski",
+                answer, sources = self._answer_cembrowski(
+                    question, retrieved_chunks, history
                 )
+                return QueryResult(answer=answer, route="cembrowski", sources=sources)
 
-        return self._answer_nih(question, history, search_question), "nih"
+        answer, sources = self._answer_nih(question, history, search_question)
+        return QueryResult(answer=answer, route="nih", sources=sources)
 
     def _condense_question(
         self, question: str, history: list[ChatMessage]
@@ -187,9 +248,13 @@ class QueryEngine:
         question: str,
         chunks: list[RetrievedChunk],
         history: list[ChatMessage] | None = None,
-    ) -> str:
-        """Build a grounded prompt from Cembrowski corpus chunks and generate an answer."""
+    ) -> tuple[str, list[SourceRef]]:
+        """
+        Build a grounded prompt from Cembrowski corpus chunks and generate an
+        answer, returning it alongside the numbered sources it was shown.
+        """
         context = self._build_context(chunks)
+        sources = self._cembrowski_sources(chunks)
 
         response = self.openai.chat.completions.create(
             model=CHAT_MODEL,
@@ -214,7 +279,33 @@ Context:
             ],
         )
 
-        return response.choices[0].message.content or ""
+        return response.choices[0].message.content or "", sources
+
+    def _cembrowski_sources(
+        self, chunks: list[RetrievedChunk]
+    ) -> list[SourceRef]:
+        """
+        One SourceRef per chunk, numbered from 1 in the same order as
+        `_build_context` writes the `SOURCE {i}` blocks — so `[i]` in the answer
+        maps to `sources[i - 1]`. Documents carry no `site_path`, so their `url`
+        is None and they render as an unlinked, title-only citation.
+        """
+        sources: list[SourceRef] = []
+        for i, chunk in enumerate(chunks, start=1):
+            kind = "document" if chunk.source_type == "document" else "poster"
+            sources.append(
+                SourceRef(
+                    index=i,
+                    kind=kind,
+                    title=chunk.title,
+                    authors=chunk.authors or [],
+                    url=chunk.site_path,
+                    page=chunk.page,
+                    publication=chunk.publication,
+                    year=chunk.year,
+                )
+            )
+        return sources
 
     def _search_nih(self, question: str) -> list[NIHResult]:
         return nih.search_nih(question)
@@ -242,8 +333,11 @@ Context:
         question: str,
         history: list[ChatMessage] | None = None,
         search_question: str | None = None,
-    ) -> str:
-        """Answer a general medical question from NIH (MedlinePlus/PubMed) search results."""
+    ) -> tuple[str, list[SourceRef]]:
+        """
+        Answer a general medical question from NIH (MedlinePlus/PubMed) search
+        results, returning the answer alongside the numbered sources shown.
+        """
         results = self._search_nih(search_question or question)
 
         if not results:
@@ -251,10 +345,22 @@ Context:
                 "I couldn't find reliable NIH information to answer this "
                 "question. Please try rephrasing, or consult a healthcare "
                 "professional.\n\n"
-                "This is general information, not medical advice."
+                "This is general information, not medical advice.",
+                [],
             )
 
         context = self._build_nih_context(results)
+        sources = [
+            SourceRef(
+                index=i,
+                kind="nih",
+                title=result.title,
+                url=result.url,
+                publication=result.journal or result.source,
+                year=int(result.year) if result.year and result.year.isdigit() else None,
+            )
+            for i, result in enumerate(results, start=1)
+        ]
 
         response = self.openai.chat.completions.create(
             model=CHAT_MODEL,
@@ -279,7 +385,7 @@ Context:
             ],
         )
 
-        return response.choices[0].message.content or ""
+        return response.choices[0].message.content or "", sources
 
     def _embed_query(self, question: str) -> list[float]:
         result = self.voyage.multimodal_embed(
@@ -315,6 +421,10 @@ Context:
                         publication=payload.get("publication"),
                         year=payload.get("year"),
                         page_label=payload.get("page_label"),
+                        authors=payload.get("authors"),
+                        page=payload.get("page"),
+                        site_path=payload.get("site_path"),
+                        poster_id=payload.get("poster_id"),
                         caption=payload.get("caption"),
                         image_type=payload.get("image_type"),
                     )
@@ -341,6 +451,10 @@ Context:
                         publication=payload.get("publication"),
                         year=payload.get("year"),
                         page_label=payload.get("page_label"),
+                        authors=payload.get("authors"),
+                        page=payload.get("page"),
+                        site_path=payload.get("site_path"),
+                        poster_id=payload.get("poster_id"),
                     )
                 )
 

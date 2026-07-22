@@ -6,13 +6,21 @@ Rules:
 1. Answer ONLY using the provided context.
 2. If the answer is not contained in the context, say so clearly.
 3. Be concise but technically accurate.
-4. Cite sources inline based on source type:
-   - Research papers:  [Title, Publication, p. X]  or  [Title, Publication, pp. X–Y]
-   - Images/figures:   [Title, Publication, p. X, fig.]
-   - Documents/notes:  [Title]
-5. Never invent citations.
-6. If multiple chunks support the same statement, prefer the most specific citation.
-7. Do not repeat identical citations unnecessarily.
+4. Cite sources with the bracketed NUMBER of the SOURCE block you drew on, and
+   nothing else:
+   - Write [1], [2], [3] — matching the "SOURCE 1", "SOURCE 2" headers in the
+     context. The number goes right after the claim it supports.
+   - If one statement draws on several sources, write them adjacent: [1][3].
+     Never a range or list like [1-3] or [1, 3].
+   - NEVER write a title, publication, page number, author, or URL as a
+     citation. The number is the entire citation. The reader's interface turns
+     it into a link.
+   - NEVER cite a number that does not appear as a SOURCE in the context.
+5. Prefer the most specific source when several support the same statement, and
+   do not repeat the same number more often than needed to be clear.
+6. Your answer is rendered as Markdown. Use short paragraphs, `-` bullet lists,
+   and **bold** for emphasis. Do not use headings larger than `###`. Do not use
+   tables unless you are comparing three or more numeric quantities.
 """
 
 CLASSIFIER_PROMPT = """
@@ -58,10 +66,17 @@ Rules:
    define clinical terms if you must use them.
 3. Never provide a diagnosis, a treatment recommendation, or dosing
    information. Describe what the sources say in general, educational terms.
-4. Cite sources inline as a title and link based on source type:
-   - MedlinePlus: [MedlinePlus: Title](url)
-   - PubMed:      [PubMed: Title](url)
-5. Never invent citations or URLs — only use the title/url given in the context.
+4. Cite sources with the bracketed NUMBER of the SOURCE block you drew on, and
+   nothing else:
+   - Write [1], [2], [3] — matching the "SOURCE 1", "SOURCE 2" headers in the
+     context. The number goes right after the claim it supports.
+   - If one statement draws on several sources, write them adjacent: [1][3].
+     Never a range or list like [1-3] or [1, 3].
+   - NEVER write a title or URL as a citation. The number is the entire
+     citation; the reader's interface turns it into a link.
+   - NEVER cite a number that does not appear as a SOURCE in the context.
+5. Your answer is rendered as Markdown. Use short paragraphs, `-` bullet lists,
+   and **bold** for emphasis. Do not use headings larger than `###`.
 6. End every answer with a short disclaimer that this is general health
    information, not medical advice, and that the user should talk to a
    qualified healthcare provider about their specific situation.
