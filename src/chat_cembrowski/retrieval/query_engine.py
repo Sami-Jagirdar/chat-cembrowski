@@ -25,7 +25,16 @@ CLASSIFIER_MODEL = "gpt-4.1-mini"
 # Minimum top-hit Qdrant cosine score to trust the Cembrowski corpus for a
 # question classified as Cembrowski-specific. Below this, retrieval is too
 # weak to be reliable, so the question is routed to NIH instead.
-SCORE_THRESHOLD = 0.4
+#
+# Measured against the live collection (voyage-multimodal-3.5, page-based
+# chunks). On-topic questions score 0.32-0.65; general medical questions that
+# belong on the NIH path top out at 0.24. Short on-topic questions sit at the
+# bottom of that range -- "tell me about gem 4000" scores 0.33 -- so the
+# previous value of 0.4 cut through the middle of the on-topic band and sent
+# terse but valid corpus questions to NIH. 0.30 sits in the empty gap between
+# the two populations. Re-measure before changing the embedding model or the
+# chunking strategy, since both shift the score distribution.
+SCORE_THRESHOLD = 0.30
 
 
 @dataclass
