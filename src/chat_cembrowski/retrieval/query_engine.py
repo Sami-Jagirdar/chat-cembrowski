@@ -13,7 +13,13 @@ from chat_cembrowski.data.vectordb import (
 
 from . import nih
 from .nih import NIHResult
-from .prompts import CLASSIFIER_PROMPT, CONDENSE_PROMPT, NIH_SYSTEM_PROMPT, SYSTEM_PROMPT
+from .prompts import (
+    CLASSIFIER_PROMPT,
+    CONDENSE_PROMPT,
+    META_ANSWER,
+    NIH_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+)
 
 # A single prior turn: {"role": "user" | "assistant", "content": str}. Already
 # the OpenAI message shape, so it drops straight into a `messages` list.
@@ -147,11 +153,14 @@ class QueryEngine:
            standalone question (cheap LLM call) — used for classification,
            embedding, and search so context-dependent follow-ups (e.g. "what
            about in women?") still retrieve correctly.
-        1. Classify the (standalone) question as "cembrowski" or "general"
-           (cheap LLM call).
-        2. If "cembrowski": embed + search Qdrant. If the top hit clears
+        1. Classify the (standalone) question as "cembrowski", "general", or
+           "meta" (cheap LLM call).
+        2. If "meta" (a question about the site/assistant itself, not a
+           health/research topic): answer with the static META_ANSWER —
+           no retrieval at all, Cembrowski or NIH.
+        3. If "cembrowski": embed + search Qdrant. If the top hit clears
            SCORE_THRESHOLD, answer from the Cembrowski corpus.
-        3. Otherwise (classified "general", or Cembrowski retrieval was too
+        4. Otherwise (classified "general", or Cembrowski retrieval was too
            weak to trust): answer from NIH (MedlinePlus + PubMed).
 
         The raw `question` (plus `history`) is what's sent to the model for
@@ -168,6 +177,9 @@ class QueryEngine:
         )
 
         label = self._classify(search_question)
+
+        if label == "meta":
+            return QueryResult(answer=META_ANSWER, route="meta", sources=[])
 
         if label != "general":
             query_embedding = self._embed_query(search_question)
@@ -221,11 +233,15 @@ class QueryEngine:
 
     def _classify(self, question: str) -> str:
         """
-        Classify a question as "cembrowski" or "general" via a cheap LLM call.
+        Classify a question as "cembrowski", "general", or "meta" via a
+        cheap LLM call.
 
-        Defaults to "cembrowski" on any API failure — the retrieval-score
-        check in `query_with_route` still catches weak/off-topic matches and
-        routes them to NIH, so failing open here doesn't bypass the fallback.
+        Defaults to "cembrowski" on any API failure or an unrecognized
+        label — the retrieval-score check in `query_structured` still
+        catches weak/off-topic matches and routes them to NIH, so failing
+        open here doesn't bypass that fallback. (Never defaults to "meta":
+        that route skips retrieval entirely, so a wrong "meta" guess would
+        leave the answer stuck with a canned response.)
         """
         try:
             response = self.openai.chat.completions.create(
@@ -241,7 +257,11 @@ class QueryEngine:
         except Exception:
             return "cembrowski"
 
-        return "general" if "general" in label else "cembrowski"
+        if "meta" in label:
+            return "meta"
+        if "general" in label:
+            return "general"
+        return "cembrowski"
 
     def _answer_cembrowski(
         self,
