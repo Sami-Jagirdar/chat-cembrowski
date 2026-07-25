@@ -420,6 +420,66 @@ def chunk_paper_pages(
     return chunks
 
 
+def chunk_scanned_pages(paper: Paper, pages: list[dict]) -> list[Chunk]:
+    """
+    Build one multimodal Chunk per page of a scanned document.
+
+    The scanned counterpart to `chunk_paper_pages`. That function reads a page's
+    markdown out of the PDF's text layer; a scan has none, so the text comes
+    from `ocr.ocr_pdf` instead and is passed in here already transcribed. The
+    resulting payload is deliberately identical in shape to the born-digital
+    page chunks, so scanned and native sources retrieve and cite the same way.
+
+    Page numbering differs in one respect: the number stored is the folio
+    *printed on the page*, read off the scan during transcription. A scanned
+    book's PDF index rarely matches its printed numbering — front matter is
+    numbered separately and a two-up capture halves the count — so the printed
+    folio is the only value that makes a citation checkable against a physical
+    copy. Pages with no printed folio (title page, part openers) fall back to
+    their sequential position.
+
+    Args:
+        paper: Paper object supplying title, authors, year, publication.
+        pages: Output of `ocr.ocr_pdf` — dicts with 'sheet', 'half', 'sequence',
+               'image_file', 'text' and 'printed_page'.
+
+    Returns:
+        List of Chunk objects, one per page, ready for embedding and upsert.
+    """
+    if not pages:
+        logger.warning(f"Paper {paper.id} has no transcribed pages. Skipping.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, page in enumerate(pages):
+        page_text = page.get("text", "").strip()
+        if not page_text:
+            continue
+
+        page_number = page.get("printed_page") or page["sequence"]
+
+        chunks.append(
+            Chunk(
+                # Keyed on the source sheet and half rather than the sequence,
+                # so re-running after excluding a page or extending the range
+                # overwrites each page in place instead of duplicating it.
+                id=str(
+                    uuid.uuid5(
+                        PAGE_ID_NAMESPACE,
+                        f"{paper.id}:scan:{page['sheet']}{page['half']}",
+                    )
+                ),
+                text=_build_page_embed_text(paper, page_text),
+                payload=_build_page_payload(
+                    paper, i, page_text, page["image_file"], page_number
+                ),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} scanned page chunks.")
+    return chunks
+
+
 # Maps Document.file_type → LangChain Language enum for code-aware splitting.
 # Unlisted types fall back to MARKDOWN (good general-purpose prose splitter).
 _CODE_LANGUAGE_MAP: dict[str, Language] = {
