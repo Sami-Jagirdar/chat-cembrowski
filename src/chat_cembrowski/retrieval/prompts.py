@@ -34,21 +34,53 @@ CLASSIFIER_PROMPT = """
 You are a router for a question-answering system with three kinds of
 questions:
 
-1. "cembrowski" — a corpus of George Cembrowski's own research papers,
-   documents, and figures (clinical chemistry / laboratory medicine topics:
-   troponin, blood gas analyzers, laboratory analyzers, sample tubes, etc.)
-2. "general" — general medical/health questions from the public that are NOT
-   about Cembrowski's specific research (e.g. symptoms, conditions,
-   treatments, general health information).
+1. "cembrowski" — the corpus: George Cembrowski's own research posters,
+   papers and figures, together with his textbook "Laboratory Quality
+   Management: QC = QA" (Cembrowski & Carey, ASCP Press). Between them they
+   cover how a clinical laboratory measures, controls and assures the quality
+   of its testing:
+     - control rules and procedures: Westgard multirules, 1_3s, 2_2s, R_4s,
+       cumulative sum (cusum), power functions, false rejection and error
+       detection, Levey-Jennings charts
+     - the statistics behind them: standard deviation, standard error of the
+       mean, distributions, imprecision, bias, biologic and analytic
+       variation, critical and allowable error, sigma metrics
+     - quality control from patient data: delta checks, average of normals,
+       moving averages, exponential smoothing, anion gap and other
+       interparametric checks, red cell indices
+     - instruments and specimens: troponin assays, blood gas analyzers, GEM,
+       iSTAT, Radiometer, Siemens, Sysmex, A1c, hematology analyzers,
+       Barricor and other blood drawing tubes, cartridge stability,
+       preanalytical error
+     - laboratory operations: the testing process itself, test utilization
+       and overtesting, overdiagnosis driven by follow-up testing,
+       proficiency testing and external quality assessment, method
+       evaluation, computers in quality control, accreditation and
+       regulatory requirements
+2. "general" — a member of the public asking about their own health:
+   symptoms, what a condition is, how it is treated, what a result might mean
+   for them, diet and lifestyle. These questions are about the PATIENT.
 3. "meta" — questions about this website or assistant ITSELF, not about any
    health/research topic: what it is, what it's for, what it can help with,
    who built it, how to use it, "what are you", "what is the purpose of
    this website/site/page", etc.
 
+The line between "cembrowski" and "general" is whether the question is about
+THE LABORATORY or about THE PATIENT. Asking how a test is controlled,
+validated, monitored, or over-ordered is "cembrowski", even when it names an
+everyday analyte. Asking what a result means for someone's health is
+"general", even when it names the same analyte:
+
+  "How do follow-up ferritin testing suggestions cause overdiagnosis?" -> cembrowski
+  "What does a high ferritin level mean for my health?"                -> general
+  "What is the biologic variation of platelet counts on the Sysmex XN?" -> cembrowski
+  "Is a low platelet count dangerous?"                                 -> general
+  "What is the anion gap used for in quality control?"                 -> cembrowski
+  "Should I be worried about my high potassium?"                       -> general
+
 Default to "cembrowski" when unsure between cembrowski and general. Bare
 product names, model numbers, and acronyms are "cembrowski" even if you do
-not recognize them. Choose "general" only for consumer health questions with
-no laboratory or instrument angle. Choose "meta" ONLY when the question is
+not recognize them. Choose "meta" ONLY when the question is
 about the site/assistant itself — never for a question that's actually
 asking about a health, medical, or research topic, even if phrased as
 "what does this cover" in a health context.

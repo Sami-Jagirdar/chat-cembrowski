@@ -118,6 +118,26 @@ Non-technical site visitors may ask general medical questions unrelated to Cembr
 2. **Retrieve + score-check** — if labeled `"cembrowski"`, the question is embedded and searched against Qdrant as usual. The top hit's cosine score must clear `SCORE_THRESHOLD` (0.30, in `query_engine.py`) to be trusted; this catches questions that were misclassified or simply aren't covered by the corpus.
 3. **Route** — a strong Cembrowski match is answered via `_answer_cembrowski` (existing `SYSTEM_PROMPT`, cites Cembrowski's papers/documents/images). Everything else — `"general"`-labeled questions, or weak/no Cembrowski matches — is answered via `_answer_nih`.
 
+**The classifier is the only gate on the corpus, so `CLASSIFIER_PROMPT` must be updated whenever
+the corpus gains material.** Note the asymmetry in step 2: a `"cembrowski"` label still gets
+score-checked and can fall back to NIH, but a `"general"` label **skips retrieval entirely** —
+there is no safety net in that direction. A question the classifier misfiles as `"general"` is
+unanswerable no matter how well it would have retrieved.
+
+This is not hypothetical. When the Cembrowski & Carey textbook was ingested, the prompt still
+described the corpus as research papers about "troponin, blood gas analyzers, sample tubes", so
+questions on QC statistics, control rules, the testing process and test utilization were filed
+as `"general"` and answered from NIH — one of them while sitting on a 0.692 top hit on exactly
+the right page. Two *poster* questions were already failing this way beforehand.
+
+Fixing it with a score threshold does not work, and it is worth knowing why: the two populations
+overlap. Genuine consumer questions reach 0.516 ("what does a high ferritin level mean for my
+health" — it matches the ferritin overdiagnosis poster), while real corpus questions drop to
+0.501. No cutoff separates them. What does separate them is the subject: **is the question about
+THE LABORATORY or about THE PATIENT?** The prompt now draws that line explicitly, with paired
+examples on the same analyte. Measured after the change: 17/17 posters and 12/12 book chapters
+route correctly, and 12/12 consumer health questions still go to NIH.
+
 `_answer_nih` calls `nih.search_nih(question)` (`src/chat_cembrowski/retrieval/nih.py`), which queries:
 - **MedlinePlus Web Service** (`wsearch.nlm.nih.gov`) — primary source; plain-language consumer health topics, no API key needed.
 - **PubMed via NCBI E-utilities** (`esearch`/`efetch`) — supplementary fallback when MedlinePlus returns few/no results; technical literature abstracts. Optional `NCBI_API_KEY` / `NCBI_EMAIL` env vars raise the free rate limit (3→10 req/sec) and follow NCBI etiquette, but both services work without any key.
