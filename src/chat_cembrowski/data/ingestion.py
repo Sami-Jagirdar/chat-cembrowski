@@ -16,6 +16,7 @@ import fitz  # PyMuPDF
 import serpapi
 import requests
 from openai import OpenAI
+from . import ocr
 from .models import Paper
 from .serialization import save_paper, save_papers_to_json, load_papers_from_json
 
@@ -212,8 +213,24 @@ def fetch_author_papers(
     return papers
 
 
-def _extract_leading_text(pdf_path: Path, max_pages: int = 3) -> str:
-    """Returns concatenated text from the first few pages."""
+def _extract_leading_text(
+    pdf_path: Path,
+    max_pages: int = 3,
+    client: Optional[OpenAI] = None,
+) -> str:
+    """
+    Returns concatenated text from the first few pages.
+
+    Falls back to OCR when the PDF has no text layer. A scanned cover is an
+    image, so without this the document would be filed with no title, authors
+    or year — and metadata is what every citation to it is built from.
+
+    Args:
+        pdf_path:  Path to the PDF.
+        max_pages: How many leading pages to read.
+        client:    OpenAI client used for the OCR fallback. Without one, a
+                   scanned PDF simply returns "".
+    """
     doc = fitz.open(str(pdf_path))
     if not doc:
         return ""
@@ -228,7 +245,16 @@ def _extract_leading_text(pdf_path: Path, max_pages: int = 3) -> str:
             res += text
         except Exception as e:
             logger.warning(f"Error extracting text from page {page.number} of {pdf_path.name}: {e}")
-    return res
+
+    if res.strip() or client is None:
+        return res
+
+    logger.info(f"No text layer in {pdf_path.name} — reading metadata via OCR.")
+    try:
+        return ocr.ocr_leading_text(pdf_path, client)
+    except Exception as e:
+        logger.warning(f"OCR metadata extraction failed for {pdf_path.name}: {e}")
+        return ""
 
 
 def _extract_metadata_with_llm(first_page_text: str, client: OpenAI) -> dict:
@@ -298,7 +324,7 @@ def ingest_local_pdfs(
             continue
 
         logger.info(f"Creating Paper for unregistered PDF: {pdf_path.name}")
-        first_page_text = _extract_leading_text(pdf_path)
+        first_page_text = _extract_leading_text(pdf_path, client=client)
 
         if not first_page_text.strip():
             logger.warning(f"No extractable text in leading pages of {pdf_path.name}, skipping metadata extraction.")
@@ -339,7 +365,7 @@ def ingest_local_pdfs(
             logger.warning(f"PDF not found for patch: {pdf_path.name}")
             continue
 
-        first_page_text = _extract_leading_text(pdf_path)
+        first_page_text = _extract_leading_text(pdf_path, client=client)
         if not first_page_text.strip():
             logger.warning(f"No extractable text in leading pages of {pdf_path.name}, cannot patch.")
             continue
