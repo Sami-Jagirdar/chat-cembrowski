@@ -11,7 +11,7 @@ from chat_cembrowski.data.vectordb import (
     EMBEDDING_MODEL,
 )
 
-from . import nih
+from . import authors, nih
 from .nih import NIHResult
 from .prompts import (
     CLASSIFIER_PROMPT,
@@ -51,6 +51,7 @@ class RetrievedChunk:
     text: str
     chunk_index: int
     # Paper-specific
+    paper_id: str | None = None
     publication: str | None = None
     year: int | None = None
     page_label: str | None = None
@@ -153,7 +154,12 @@ class QueryEngine:
            standalone question (cheap LLM call) — used for classification,
            embedding, and search so context-dependent follow-ups (e.g. "what
            about in women?") still retrieve correctly.
-        1. Classify the (standalone) question as "cembrowski", "general", or
+        1. Check the (standalone) question against every author name known to
+           the corpus (fuzzy match, no LLM call). A confident hit answers
+           from that person's works across the corpus (metadata filter, not
+           vector search — author names are never embedded) and skips
+           classification entirely.
+        2. Otherwise, classify the question as "cembrowski", "general", or
            "meta" (cheap LLM call).
         2. If "meta" (a question about the site/assistant itself, not a
            health/research topic): answer with the static META_ANSWER —
@@ -175,6 +181,11 @@ class QueryEngine:
         search_question = (
             self._condense_question(question, history) if history else question
         )
+
+        matched_author = self._match_author(search_question)
+        if matched_author:
+            answer, sources = self._answer_author(question, matched_author, history)
+            return QueryResult(answer=answer, route="author", sources=sources)
 
         label = self._classify(search_question)
 
@@ -272,9 +283,34 @@ class QueryEngine:
         """
         Build a grounded prompt from Cembrowski corpus chunks and generate an
         answer, returning it alongside the numbered sources it was shown.
+
+        Chunks split into `citable` (resolves to a real URL — a linked
+        poster) and `background` (documents, and posters not yet linked via
+        scripts/link_posters.py). Only `citable` chunks become numbered
+        SOURCE blocks and SourceRefs, so the reader-facing sources list is
+        never handed something unclickable. `background` chunks still inform
+        the answer, just without a citation number — see prompts.SYSTEM_PROMPT
+        rule 8.
         """
-        context = self._build_context(chunks)
-        sources = self._cembrowski_sources(chunks)
+        citable_chunks = [c for c in chunks if c.site_path]
+        background_chunks = [c for c in chunks if not c.site_path]
+
+        context = self._build_context(citable_chunks)
+        background = self._build_background_context(background_chunks)
+        sources = self._cembrowski_sources(citable_chunks)
+
+        user_content = f"""
+Question:
+{question}
+
+Context:
+{context}
+"""
+        if background:
+            user_content += f"""
+Additional background (not citable — do not cite these with a bracket number, use only to inform your answer):
+{background}
+"""
 
         response = self.openai.chat.completions.create(
             model=CHAT_MODEL,
@@ -288,18 +324,74 @@ class QueryEngine:
                 *(history or []), # type: ignore
                 {
                     "role": "user",
-                    "content": f"""
-Question:
-{question}
-
-Context:
-{context}
-""",
+                    "content": user_content,
                 },
             ],
         )
 
         return response.choices[0].message.content or "", sources
+
+    def _build_background_context(self, chunks: list[RetrievedChunk]) -> str:
+        """
+        Unnumbered context from non-citable chunks (documents, unlinked
+        posters) — informs the answer but is never assigned a SOURCE number,
+        so it can never be cited.
+        """
+        if not chunks:
+            return ""
+
+        sections = []
+        for chunk in chunks:
+            header_lines = [f"Title: {chunk.title}"]
+            if chunk.file_type:
+                header_lines.append(f"Type: {chunk.file_type}")
+            if chunk.publication:
+                header_lines.append(f"Publication: {chunk.publication}")
+            if chunk.year:
+                header_lines.append(f"Year: {chunk.year}")
+            header = "\n".join(header_lines)
+            body = chunk.caption or chunk.text
+            sections.append(f"{header}\n\nContent:\n{body}")
+
+        return "\n\n----\n\n".join(sections)
+
+    def _match_author(self, question: str) -> str | None:
+        """Fuzzy-match `question` against every author name known to the corpus."""
+        try:
+            known = authors.get_known_authors(self.qdrant, self.collection_name)
+            return authors.match_author(question, known)
+        except Exception:
+            return None
+
+    def _answer_author(
+        self,
+        question: str,
+        author_name: str,
+        history: list[ChatMessage] | None = None,
+    ) -> tuple[str, list[SourceRef]]:
+        """
+        Answer a "who is X" question from every distinct work crediting
+        `author_name` across the corpus (a payload filter, not a vector
+        search — exhaustive rather than whatever lands in the top-k).
+
+        Collapses to one representative chunk per distinct work (lowest
+        chunk_index, i.e. first page) before handing off to
+        `_answer_cembrowski`, which applies the same citable/background split
+        as any other Cembrowski-routed answer.
+        """
+        points = authors.fetch_chunks_by_author(
+            self.qdrant, self.collection_name, author_name
+        )
+
+        best_by_work: dict[str, RetrievedChunk] = {}
+        for point in points:
+            chunk = self._point_to_chunk(point)
+            key = chunk.paper_id or chunk.title
+            current = best_by_work.get(key)
+            if current is None or chunk.chunk_index < current.chunk_index:
+                best_by_work[key] = chunk
+
+        return self._answer_cembrowski(question, list(best_by_work.values()), history)
 
     def _cembrowski_sources(
         self, chunks: list[RetrievedChunk]
@@ -423,62 +515,57 @@ Context:
             with_payload=True,
         ).points
 
-        chunks = []
+        return [self._point_to_chunk(point, score=point.score) for point in results]
 
-        for point in results:
-            payload = point.payload or {}
-            chunk_category = payload.get("chunk_category", "text")
-            source_type = payload.get("source_type", "paper")
+    def _point_to_chunk(self, point, score: float = 0.0) -> RetrievedChunk:
+        """Convert one Qdrant point into a RetrievedChunk, routed by payload shape."""
+        payload = point.payload or {}
+        chunk_category = payload.get("chunk_category", "text")
+        source_type = payload.get("source_type", "paper")
 
-            if chunk_category == "image":
-                chunks.append(
-                    RetrievedChunk(
-                        score=point.score,
-                        source_type="image",
-                        title=payload.get("title", "Unknown Title"),
-                        text=payload.get("text", ""),
-                        chunk_index=payload.get("chunk_index", -1),
-                        publication=payload.get("publication"),
-                        year=payload.get("year"),
-                        page_label=payload.get("page_label"),
-                        authors=payload.get("authors"),
-                        page=payload.get("page"),
-                        site_path=payload.get("site_path"),
-                        poster_id=payload.get("poster_id"),
-                        caption=payload.get("caption"),
-                        image_type=payload.get("image_type"),
-                    )
-                )
-            elif source_type == "document":
-                chunks.append(
-                    RetrievedChunk(
-                        score=point.score,
-                        source_type="document",
-                        title=payload.get("title", "Unknown Document"),
-                        text=payload.get("text", ""),
-                        chunk_index=payload.get("chunk_index", -1),
-                        file_type=payload.get("file_type"),
-                    )
-                )
-            else:
-                chunks.append(
-                    RetrievedChunk(
-                        score=point.score,
-                        source_type="paper",
-                        title=payload.get("title", "Unknown Title"),
-                        text=payload.get("text", ""),
-                        chunk_index=payload.get("chunk_index", -1),
-                        publication=payload.get("publication"),
-                        year=payload.get("year"),
-                        page_label=payload.get("page_label"),
-                        authors=payload.get("authors"),
-                        page=payload.get("page"),
-                        site_path=payload.get("site_path"),
-                        poster_id=payload.get("poster_id"),
-                    )
-                )
-
-        return chunks
+        if chunk_category == "image":
+            return RetrievedChunk(
+                score=score,
+                source_type="image",
+                title=payload.get("title", "Unknown Title"),
+                text=payload.get("text", ""),
+                chunk_index=payload.get("chunk_index", -1),
+                paper_id=payload.get("paper_id"),
+                publication=payload.get("publication"),
+                year=payload.get("year"),
+                page_label=payload.get("page_label"),
+                authors=payload.get("authors"),
+                page=payload.get("page"),
+                site_path=payload.get("site_path"),
+                poster_id=payload.get("poster_id"),
+                caption=payload.get("caption"),
+                image_type=payload.get("image_type"),
+            )
+        elif source_type == "document":
+            return RetrievedChunk(
+                score=score,
+                source_type="document",
+                title=payload.get("title", "Unknown Document"),
+                text=payload.get("text", ""),
+                chunk_index=payload.get("chunk_index", -1),
+                file_type=payload.get("file_type"),
+            )
+        else:
+            return RetrievedChunk(
+                score=score,
+                source_type="paper",
+                title=payload.get("title", "Unknown Title"),
+                text=payload.get("text", ""),
+                chunk_index=payload.get("chunk_index", -1),
+                paper_id=payload.get("paper_id"),
+                publication=payload.get("publication"),
+                year=payload.get("year"),
+                page_label=payload.get("page_label"),
+                authors=payload.get("authors"),
+                page=payload.get("page"),
+                site_path=payload.get("site_path"),
+                poster_id=payload.get("poster_id"),
+            )
 
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
         """Build retrieval context for the LLM, rendering papers and documents differently."""
