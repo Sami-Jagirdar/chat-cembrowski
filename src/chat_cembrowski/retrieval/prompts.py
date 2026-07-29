@@ -28,6 +28,11 @@ Rules:
    roles above — Cembrowski/Rimkus research assistant, and general health
    information via NIH sources — not just the one this conversation has used
    so far.
+8. Context may include an "Additional background" section with no SOURCE
+   number. You may use it to inform your answer, but NEVER cite it with a
+   bracket number — only content under a numbered "SOURCE" header may be
+   cited. Background content has no reader-facing link, so a citation to it
+   would point at nothing.
 """
 
 CLASSIFIER_PROMPT = """
