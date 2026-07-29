@@ -15,7 +15,7 @@ import PIL.Image
 import voyageai
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
 
 from .chunker import Chunk
 
@@ -109,6 +109,16 @@ def ensure_collection(
         )
     else:
         logger.info(f"Collection '{collection_name}' already exists — skipping creation.")
+
+    # retrieval.authors filters on this field (Qdrant scroll with a payload
+    # filter) to answer "who is X" questions — that filter 400s without an
+    # explicit index. Called unconditionally (not just on fresh collections)
+    # since it's idempotent and existing collections predate this field.
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="authors",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
 
 
 def _batched(iterable, n: int) -> Iterator[list]:

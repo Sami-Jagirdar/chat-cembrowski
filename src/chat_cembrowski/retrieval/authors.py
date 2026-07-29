@@ -17,7 +17,7 @@ from typing import Iterator
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz, process, utils
 
 # Long enough to avoid re-scrolling the collection on every question; short
 # enough that a poster ingested straight into Qdrant (no backend redeploy —
@@ -66,12 +66,20 @@ def match_author(question: str, known_authors: list[str]) -> str | None:
     """
     Best fuzzy match for `question` among `known_authors`, or None if nothing
     clears MATCH_THRESHOLD. partial_ratio so a full name can match against a
-    substring of a longer question.
+    substring of a longer question; `default_process` lowercases and strips
+    punctuation on both sides first, since questions arrive lowercase but
+    corpus names are stored title-case ("Mark Cervinski") — without this, the
+    case mismatch alone was enough to push a genuine match below threshold.
     """
     if not known_authors:
         return None
 
-    best = process.extractOne(question, known_authors, scorer=fuzz.partial_ratio)
+    best = process.extractOne(
+        question,
+        known_authors,
+        scorer=fuzz.partial_ratio,
+        processor=utils.default_process,
+    )
     if best is None:
         return None
 
