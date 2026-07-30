@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-COLLECTION_NAME = "cembrowski"
+COLLECTION_NAME = "BAPa-V1"
 
 EMBEDDING_MODEL = "voyage-multimodal-3.5"
 VECTOR_DIM = 1024
