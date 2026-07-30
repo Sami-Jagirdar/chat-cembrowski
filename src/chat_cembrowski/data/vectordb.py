@@ -15,7 +15,7 @@ import PIL.Image
 import voyageai
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
 
 from .chunker import Chunk
 
@@ -35,6 +35,7 @@ PAGE_BATCH_SIZE = 8      # full-page renders are heavier still than cropped figu
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 QDRANT_LOCAL_PATH = PROJECT_ROOT / "data" / "vectors"
+PAPERS_DIR = PROJECT_ROOT / "data" / "papers"
 IMAGES_DIR = PROJECT_ROOT / "data" / "images"
 PAGE_IMAGES_DIR = PROJECT_ROOT / "data" / "page_images"
 PAGE_RENDER_ZOOM = 2.0   # ~144 DPI; see parser.DEFAULT_PAGE_RENDER_ZOOM
@@ -108,6 +109,16 @@ def ensure_collection(
         )
     else:
         logger.info(f"Collection '{collection_name}' already exists — skipping creation.")
+
+    # retrieval.authors filters on this field (Qdrant scroll with a payload
+    # filter) to answer "who is X" questions — that filter 400s without an
+    # explicit index. Called unconditionally (not just on fresh collections)
+    # since it's idempotent and existing collections predate this field.
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="authors",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
 
 
 def _batched(iterable, n: int) -> Iterator[list]:
@@ -258,7 +269,14 @@ def embed_and_upsert(
 
 if __name__ == "__main__":
     import argparse
-    from .chunker import chunk_paper, chunk_paper_images, chunk_paper_pages, chunk_document
+    from . import ocr
+    from .chunker import (
+        chunk_paper,
+        chunk_paper_images,
+        chunk_paper_pages,
+        chunk_scanned_pages,
+        chunk_document,
+    )
     from .serialization import load_papers_from_json, save_paper, load_documents_from_json, save_document
 
     logging.basicConfig(level=logging.INFO)
@@ -271,12 +289,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--method",
-        choices=["page", "split"],
-        default="page",
+        choices=["auto", "page", "split", "scanned"],
+        default="auto",
         help=(
-            "Chunking strategy: 'page' (default, primary) renders each PDF page "
-            "as a full image paired with its markdown text; 'split' uses the "
-            "original strategy of separate text chunks + cropped figure chunks."
+            "Chunking strategy. 'auto' (default) uses 'scanned' for a PDF with "
+            "no text layer and 'page' otherwise. 'page' renders each PDF page as "
+            "a full image paired with its markdown text; 'scanned' does the same "
+            "but transcribes the text with OCR, splitting two-up spreads; "
+            "'split' uses the original strategy of separate text chunks + "
+            "cropped figure chunks."
         ),
     )
     parser.add_argument(
@@ -288,16 +309,69 @@ if __name__ == "__main__":
             f"(default: {PAGE_RENDER_ZOOM})."
         ),
     )
+    parser.add_argument(
+        "--ocr-zoom",
+        type=float,
+        default=ocr.DEFAULT_OCR_ZOOM,
+        help=(
+            f"Render scale factor for --method scanned (default: "
+            f"{ocr.DEFAULT_OCR_ZOOM}). Higher than --zoom because the model has "
+            "to read these glyphs rather than being handed a text layer."
+        ),
+    )
+    parser.add_argument(
+        "--paper-id",
+        default=None,
+        help="Process only the paper with this ID. Documents are skipped too.",
+    )
+    parser.add_argument(
+        "--ocr-workers",
+        type=int,
+        default=ocr.DEFAULT_OCR_WORKERS,
+        help=(
+            f"For --method scanned: pages transcribed concurrently "
+            f"(default: {ocr.DEFAULT_OCR_WORKERS})."
+        ),
+    )
+    parser.add_argument(
+        "--first-sheet",
+        type=int,
+        default=None,
+        help="For --method scanned: first PDF sheet to ingest (1-based, inclusive).",
+    )
+    parser.add_argument(
+        "--last-sheet",
+        type=int,
+        default=None,
+        help=(
+            "For --method scanned: last PDF sheet to ingest (1-based, inclusive). "
+            "Use this to cut loose inserts captured after the work itself."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-units",
+        default="",
+        help=(
+            "For --method scanned: comma-separated page units to skip, e.g. "
+            "'144R,145'. A unit is a sheet number plus L/R for one half of a "
+            "two-up spread."
+        ),
+    )
     args = parser.parse_args()
     collection_name = args.collection
+    exclude_units = {u.strip() for u in args.exclude_units.split(",") if u.strip()}
 
     client = get_qdrant_client()
     vo = get_voyage_client()
+    openai_client = None  # built lazily; only the scanned path needs it
 
     try:
         ensure_collection(client, recreate=False, collection_name=collection_name)
 
         for paper in load_papers_from_json():
+            if args.paper_id and paper.id != args.paper_id:
+                continue
+
             if paper.processed:
                 logger.info(
                     f"Paper '{paper.title}' (ID: {paper.id}) already "
@@ -305,7 +379,32 @@ if __name__ == "__main__":
                 )
                 continue
 
-            if args.method == "page":
+            method = args.method
+            if method == "auto":
+                method = (
+                    "page"
+                    if ocr.has_text_layer(PAPERS_DIR / paper.source_file)
+                    else "scanned"
+                )
+                logger.info(f"Paper {paper.id}: auto-selected '{method}' chunking.")
+
+            if method == "scanned":
+                if openai_client is None:
+                    openai_client = get_openai_client()
+                pages = ocr.ocr_pdf(
+                    PAPERS_DIR / paper.source_file,
+                    paper_id=paper.id,
+                    images_dir=PAGE_IMAGES_DIR,
+                    client=openai_client,
+                    zoom=args.ocr_zoom,
+                    first_sheet=args.first_sheet,
+                    last_sheet=args.last_sheet,
+                    exclude_units=exclude_units,
+                    max_workers=args.ocr_workers,
+                )
+                chunks = chunk_scanned_pages(paper, pages)
+                upsert_kwargs = dict(images_dir=PAGE_IMAGES_DIR, image_batch_size=PAGE_BATCH_SIZE)
+            elif method == "page":
                 chunks = chunk_paper_pages(paper, PAGE_IMAGES_DIR, zoom=args.zoom)
                 upsert_kwargs = dict(images_dir=PAGE_IMAGES_DIR, image_batch_size=PAGE_BATCH_SIZE)
             else:
@@ -321,6 +420,9 @@ if __name__ == "__main__":
                 save_paper(paper)
 
         for doc in load_documents_from_json():
+            if args.paper_id:
+                break  # targeting a single paper; documents are out of scope
+
             if doc.processed:
                 logger.info(f"Document '{doc.title}' already processed — skipping.")
                 continue
