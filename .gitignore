@@ -33,6 +33,7 @@ wheels/
 
 # Data
 *.json
+!scripts/eval_questions.json
 *.pdf
 *.png
 *.jpg
