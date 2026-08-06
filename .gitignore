@@ -33,9 +33,17 @@ wheels/
 
 # Data
 *.json
+!scripts/eval_questions.json
 *.pdf
+*.png
+*.jpg
+*.jpeg
 data/vectors/collection/
 data/vectors/.lock
+
+# Keep only the placeholder in data/docs
+data/docs/*
+!data/docs/.gitkeep
 
 extras/
 notes

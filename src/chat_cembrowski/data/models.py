@@ -11,6 +11,7 @@ class Paper:
     authors: Optional[list[str]] = None
     year: Optional[int] = None
     publication: Optional[str] = None
+    first_page_number: Optional[int] = None
     processed: bool = False
     text: str = ""
 
@@ -22,6 +23,7 @@ class Paper:
             "authors": self.authors,
             "year": self.year,
             "publication": self.publication,
+            "first_page_number": self.first_page_number,
             "processed": self.processed,
             "text": self.text,
         }
@@ -39,3 +41,53 @@ class Chunk:
             "text": self.text,
             "payload": self.payload,
     }
+
+@dataclass
+class Document:
+    """Represents a miscellaneous context document (txt, docx, code file)."""
+    id: str
+    title: str
+    source_file: str    # filename in data/docs/
+    file_type: str      # "txt", "docx", "py", etc.
+    text: str = ""
+    processed: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "source_file": self.source_file,
+            "file_type": self.file_type,
+            "text": self.text,
+            "processed": self.processed,
+        }
+
+
+@dataclass
+class ImageRecord:
+    """Represents an image extracted from a paper, with spatial and caption metadata."""
+    id: str
+    paper_id: str
+    source_file: str                          # filename in data/images/
+    page: int                                 # journal page number (offset applied)
+    bbox: tuple[float, float, float, float]   # (x0, y0, x1, y1) in PDF points
+    caption: Optional[str] = None
+    image_type: Optional[str] = None          # "figure", "table", "chart", "image"
+    title: Optional[str] = None
+    authors: Optional[list[str]] = None
+    year: Optional[int] = None
+    publication: Optional[str] = None
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "paper_id": self.paper_id,
+            "source_file": self.source_file,
+            "page": self.page,
+            "bbox": list(self.bbox),
+            "caption": self.caption,
+            "image_type": self.image_type,
+            "title": self.title,
+            "authors": self.authors,
+            "year": self.year,
+            "publication": self.publication,
+        }

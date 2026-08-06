@@ -1,6 +1,6 @@
 [project]
 name = "chat-cembrowski"
-version = "0.1.0"
+version = "0.4.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,8 +11,11 @@ dependencies = [
     "serpapi>=1.0.2",
     "python-dotenv>=1.0.0",
     "langchain-text-splitters>=1.1.2",
-    "fastembed>=0.8.0",
     "openai>=2.37.0",
+    "voyageai>=0.3.2",
+    "Pillow>=11.0.0",
+    "python-docx>=1.2.0",
+    "rapidfuzz>=3.14.5",
 ]
 
 [build-system]

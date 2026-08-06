@@ -9,9 +9,9 @@ import uuid
 from pathlib import Path
 
 
-from .models import Paper, Chunk
-from .parser import preprocess_markdown, parse_pdf_for_pages
-from .serialization import load_paper
+from .models import Paper, Chunk, ImageRecord, Document
+from .parser import preprocess_markdown, parse_pdf_for_pages, render_pdf_pages_as_images, DEFAULT_PAGE_RENDER_ZOOM
+from .serialization import load_paper, load_image_records_for_paper
 
 
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
@@ -24,6 +24,13 @@ CHUNK_OVERLAP = 128
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data/papers"
 JSON_DIR = PROJECT_ROOT / "data/json"
+IMAGE_JSON_DIR = PROJECT_ROOT / "data/image_json"
+PAGE_IMAGES_DIR = PROJECT_ROOT / "data/page_images"
+
+# Fixed namespace for deriving deterministic page-chunk IDs (uuid5), so
+# re-running chunk_paper_pages() on the same paper yields the same point IDs
+# and upserts overwrite in place rather than duplicating.
+PAGE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.page_chunks")
 
 def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: int, page_end: int) -> dict:
     """
@@ -38,12 +45,12 @@ def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: 
         Dictionary payload with paper metadata and chunk info
     """
     return {
+        "chunk_category": "text",
         "paper_id": paper.id,
         "title": paper.title,
         "authors": paper.authors,
         "year": paper.year,
         "publication": paper.publication,
-        "authors": paper.authors,
         "chunk_index": chunk_index,
         "page_start": page_start,
         "page_end": page_end,
@@ -53,7 +60,6 @@ def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: 
             else f"pp. {page_start}–{page_end}"
         ),
         "text": chunk_text,
-
     }
 
 # How many characters to overlap between adjacent pages to preserve
@@ -82,6 +88,14 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
     if not pages:
         logger.warning(f"Paper {paper.id} yielded no page text. Skipping.")
         return []
+
+    # journal_page = pdf_page + page_offset
+    # Anchors the first non-empty PDF page to first_page_number, handling blank leading pages.
+    page_offset = (
+        paper.first_page_number - pages[0]["page"]
+        if paper.first_page_number is not None
+        else 0
+    )
 
     # ------------------------------------------------------------------
     # 1. Build a single stitched string and record the char offset at
@@ -152,9 +166,11 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
         chunks.append(
             Chunk(
                 id=str(uuid.uuid4()),
-                text=chunk_text,
+                text=_build_text_embed_text(paper, chunk_text),
                 payload=_build_payload(
-                    paper, i, chunk_text, chunk_start_page, chunk_end_page
+                    paper, i, chunk_text,
+                    chunk_start_page + page_offset,
+                    chunk_end_page + page_offset,
                 ),
             )
         )
@@ -201,12 +217,349 @@ def chunk_paper_text_only(paper: Paper) -> list[Chunk]:
         chunks.append(
             Chunk(
                 id=str(uuid.uuid4()),
-                text=chunk_text,
-                payload=_build_payload(paper, i, chunk_text),
+                text=_build_text_embed_text(paper, chunk_text),
+                payload=_build_payload(paper, i, chunk_text, 1, 1),
             )
         )
 
     logger.info(f"Paper {paper.id} split into {len(chunks)} chunks.")
+    return chunks
+
+
+
+def _build_text_embed_text(paper: Paper, chunk_text: str) -> str:
+    """Prepend paper metadata to chunk text so the embedding carries provenance context."""
+    parts: list[str] = []
+    if paper.title:
+        parts.append(f"Title: {paper.title}")
+    if paper.year:
+        parts.append(f"Year: {paper.year}")
+    if paper.publication:
+        parts.append(f"Publication: {paper.publication}")
+    parts.append(chunk_text)
+    return "\n".join(parts)
+
+
+def _build_image_embed_text(record: ImageRecord) -> str:
+    """
+    Compose the text input sent to Voyage alongside the image.
+    Caption anchors semantics; paper metadata improves retrieval precision.
+    """
+    parts: list[str] = []
+    if record.caption:
+        parts.append(record.caption)
+    if record.title:
+        parts.append(f"Title: {record.title}")
+    if record.year:
+        parts.append(f"Year: {record.year}")
+    if record.publication:
+        parts.append(f"Publication: {record.publication}")
+    return "\n".join(parts)
+
+
+def _build_image_payload(record: ImageRecord, chunk_index: int) -> dict:
+    return {
+        "chunk_category": "image",
+        "paper_id": record.paper_id,
+        "title": record.title,
+        "authors": record.authors,
+        "year": record.year,
+        "publication": record.publication,
+        "chunk_index": chunk_index,
+        "page": record.page,
+        "page_label": f"p. {record.page}",
+        "source_file": record.source_file,
+        "bbox": list(record.bbox),
+        "caption": record.caption,
+        "image_type": record.image_type,
+        "text": _build_image_embed_text(record),
+    }
+
+
+def chunk_paper_images(
+    paper: Paper,
+    image_json_dir: Path = IMAGE_JSON_DIR,
+) -> list[Chunk]:
+    """
+    Convert all extracted ImageRecords for a paper into Chunk objects.
+
+    Chunk.text is the text input Voyage will receive alongside the image
+    (caption + title + year + publication).  Chunk.id matches ImageRecord.id
+    so vectordb can locate the image file without an extra lookup.
+    """
+    records = load_image_records_for_paper(paper.id, image_json_dir)
+    if not records:
+        logger.info(f"No image records found for paper {paper.id}.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, record in enumerate(records):
+        chunks.append(
+            Chunk(
+                id=record.id,
+                text=_build_image_embed_text(record),
+                payload=_build_image_payload(record, i),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} image chunks.")
+    return chunks
+
+
+def _build_page_embed_text(paper: Paper, page_text: str) -> str:
+    """
+    Compose the text input sent to Voyage alongside the full-page image.
+    Paper metadata anchors provenance; the page's own markdown carries the
+    text Voyage can't read directly off the rendered image.
+    """
+    parts: list[str] = []
+    if paper.title:
+        parts.append(f"Title: {paper.title}")
+    if paper.year:
+        parts.append(f"Year: {paper.year}")
+    if paper.publication:
+        parts.append(f"Publication: {paper.publication}")
+    if page_text:
+        parts.append(page_text)
+    return "\n".join(parts)
+
+
+def _build_page_payload(
+    paper: Paper,
+    chunk_index: int,
+    page_text: str,
+    source_file: str,
+    journal_page: int,
+) -> dict:
+    """
+    Payload for a whole-page image chunk. Reuses the image chunk_category so
+    it flows through the existing multimodal embed/retrieval paths; image_type
+    "page" (as opposed to "figure"/"table"/etc.) distinguishes it from cropped
+    figure chunks produced by chunk_paper_images(). `text` carries the page's
+    markdown so it can stand in as LLM context at query time.
+    """
+    return {
+        "chunk_category": "image",
+        "image_type": "page",
+        "paper_id": paper.id,
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "publication": paper.publication,
+        "chunk_index": chunk_index,
+        "page": journal_page,
+        "page_label": f"p. {journal_page}",
+        "source_file": source_file,
+        "bbox": None,  # whole page, not a crop
+        "caption": None,
+        "text": page_text,
+    }
+
+
+def chunk_paper_pages(
+    paper: Paper,
+    page_images_dir: Path = PAGE_IMAGES_DIR,
+    zoom: float = DEFAULT_PAGE_RENDER_ZOOM,
+) -> list[Chunk]:
+    """
+    Render every PDF page as a full-page image and pair it with that page's
+    markdown text, producing one multimodal Chunk per page.
+
+    This is the primary chunking strategy: rather than embedding parsed text
+    and cropped figures as separate chunks, each page's full visual layout
+    (body text, figures, tables, formatting) is embedded as a single image
+    alongside its markdown, so retrieval can surface a page as a whole unit.
+
+    Args:
+        paper: Paper object containing source_file path and metadata.
+        page_images_dir: Directory to render page PNGs into.
+        zoom: Render scale factor (72 DPI * zoom) passed to render_pdf_pages_as_images.
+
+    Returns:
+        List of Chunk objects; each payload includes page/page_label and the
+        rendered PNG filename (source_file) for the multimodal embed step.
+    """
+    pdf_path = DATA_DIR / paper.source_file
+
+    pages = parse_pdf_for_pages(pdf_path)
+    if not pages:
+        logger.warning(f"Paper {paper.id} yielded no page text. Skipping page chunking.")
+        return []
+
+    text_by_page = {p["page"]: preprocess_markdown(p["text"]) for p in pages}
+
+    # journal_page = pdf_page + page_offset (same anchoring as chunk_paper / image_extractor)
+    page_offset = (
+        paper.first_page_number - pages[0]["page"]
+        if paper.first_page_number is not None
+        else 0
+    )
+
+    rendered = render_pdf_pages_as_images(pdf_path, page_images_dir, paper.id, zoom=zoom)
+    if not rendered:
+        logger.warning(f"Paper {paper.id} yielded no rendered page images. Skipping page chunking.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, page_info in enumerate(rendered):
+        pdf_page_num = page_info["page"]
+        page_text = text_by_page.get(pdf_page_num, "")
+        journal_page = pdf_page_num + page_offset
+
+        chunks.append(
+            Chunk(
+                id=str(uuid.uuid5(PAGE_ID_NAMESPACE, f"{paper.id}:page:{pdf_page_num}")),
+                text=_build_page_embed_text(paper, page_text),
+                payload=_build_page_payload(
+                    paper, i, page_text, page_info["image_file"], journal_page
+                ),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} page chunks.")
+    return chunks
+
+
+def chunk_scanned_pages(paper: Paper, pages: list[dict]) -> list[Chunk]:
+    """
+    Build one multimodal Chunk per page of a scanned document.
+
+    The scanned counterpart to `chunk_paper_pages`. That function reads a page's
+    markdown out of the PDF's text layer; a scan has none, so the text comes
+    from `ocr.ocr_pdf` instead and is passed in here already transcribed. The
+    resulting payload is deliberately identical in shape to the born-digital
+    page chunks, so scanned and native sources retrieve and cite the same way.
+
+    Page numbering differs in one respect: the number stored is the folio
+    *printed on the page*, read off the scan during transcription. A scanned
+    book's PDF index rarely matches its printed numbering — front matter is
+    numbered separately and a two-up capture halves the count — so the printed
+    folio is the only value that makes a citation checkable against a physical
+    copy. Pages with no printed folio (title page, part openers) fall back to
+    their sequential position.
+
+    Args:
+        paper: Paper object supplying title, authors, year, publication.
+        pages: Output of `ocr.ocr_pdf` — dicts with 'sheet', 'half', 'sequence',
+               'image_file', 'text' and 'printed_page'.
+
+    Returns:
+        List of Chunk objects, one per page, ready for embedding and upsert.
+    """
+    if not pages:
+        logger.warning(f"Paper {paper.id} has no transcribed pages. Skipping.")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, page in enumerate(pages):
+        page_text = page.get("text", "").strip()
+        if not page_text:
+            continue
+
+        page_number = page.get("printed_page") or page["sequence"]
+
+        chunks.append(
+            Chunk(
+                # Keyed on the source sheet and half rather than the sequence,
+                # so re-running after excluding a page or extending the range
+                # overwrites each page in place instead of duplicating it.
+                id=str(
+                    uuid.uuid5(
+                        PAGE_ID_NAMESPACE,
+                        f"{paper.id}:scan:{page['sheet']}{page['half']}",
+                    )
+                ),
+                text=_build_page_embed_text(paper, page_text),
+                payload=_build_page_payload(
+                    paper, i, page_text, page["image_file"], page_number
+                ),
+            )
+        )
+
+    logger.info(f"Paper {paper.id} produced {len(chunks)} scanned page chunks.")
+    return chunks
+
+
+# Maps Document.file_type → LangChain Language enum for code-aware splitting.
+# Unlisted types fall back to MARKDOWN (good general-purpose prose splitter).
+_CODE_LANGUAGE_MAP: dict[str, Language] = {
+    "py":   Language.PYTHON,
+    "js":   Language.JS,
+    "jsx":  Language.JS,
+    "ts":   Language.TS,
+    "tsx":  Language.TS,
+    "c":    Language.C,
+    "cpp":  Language.CPP,
+    "h":    Language.CPP,
+    "hpp":  Language.CPP,
+    "java": Language.JAVA,
+    "sol":  Language.SOL,
+    "md":   Language.MARKDOWN,
+}
+
+
+def _build_doc_embed_text(doc: Document, chunk_text: str) -> str:
+    """Prepend document title so the embedding carries provenance context."""
+    return f"Title: {doc.title}\n{chunk_text}"
+
+
+def _build_doc_payload(doc: Document, chunk_index: int, chunk_text: str) -> dict:
+    return {
+        "source_type": "document",
+        "chunk_category": "text",
+        "doc_id": doc.id,
+        "title": doc.title,
+        "file_type": doc.file_type,
+        "chunk_index": chunk_index,
+        "text": chunk_text,
+    }
+
+
+def chunk_document(doc: Document) -> list[Chunk]:
+    """Split a Document into overlapping chunks with metadata payload.
+
+    Code files are split with a language-aware splitter; prose and structured
+    files (txt, md, docx) use the markdown splitter which respects headings
+    and paragraph boundaries produced by the docx extractor.
+
+    Args:
+        doc: Document object with extracted text.
+
+    Returns:
+        List of Chunk objects ready for embedding and upsert.
+    """
+    if not doc.text or not doc.text.strip():
+        logger.warning(f"Document '{doc.title}' has empty text. Skipping.")
+        return []
+
+    language = _CODE_LANGUAGE_MAP.get(doc.file_type, Language.MARKDOWN)
+
+    text_splitter = RecursiveCharacterTextSplitter.from_language(
+        language=language,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+
+    try:
+        raw_chunks = text_splitter.split_text(doc.text)
+    except Exception as e:
+        logger.error(f"Error splitting document '{doc.title}': {e}")
+        return []
+
+    chunks: list[Chunk] = []
+    for i, chunk_text in enumerate(raw_chunks):
+        chunk_text = chunk_text.strip()
+        if not chunk_text:
+            continue
+        chunks.append(
+            Chunk(
+                id=str(uuid.uuid4()),
+                text=_build_doc_embed_text(doc, chunk_text),
+                payload=_build_doc_payload(doc, i, chunk_text),
+            )
+        )
+
+    logger.info(f"Document '{doc.title}' split into {len(chunks)} chunks.")
     return chunks
 
 
@@ -215,10 +568,13 @@ if __name__ == "__main__":
 
     # Example usage: load papers from JSON, chunk them, and print chunk info
     paper = load_paper(JSON_DIR / "DaZlHqgIxjgJ.json")
-    try:
-        chunks = chunk_paper(paper)
-        logger.info(f"Paper '{paper.title}' produced {len(chunks)} chunks.")
-    except Exception as e:
-        logger.error(f"Failed to chunk paper '{paper.title}': {e}")
-    
+    if not paper:
+        logger.error("Failed to load paper for chunking.")
+    else:
+        try:
+            chunks = chunk_paper(paper)
+            logger.info(f"Paper '{paper.title}' produced {len(chunks)} chunks.")
+        except Exception as e:
+            logger.error(f"Failed to chunk paper '{paper.title}': {e}")
+        
 
