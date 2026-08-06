@@ -175,6 +175,12 @@ class QueryEngine:
         if voyage_client is None:
             raise ValueError("voyage_client is required.")
 
+        if openai_client is not None:
+            logger.warning(
+                "QueryEngine parameter 'openai_client' is deprecated and will be "
+                "removed in a future version. Use 'llm_client' instead."
+            )
+
         self.qdrant = qdrant_client
         self.llm_config = llm_config or llm.get_config()
         self.llm = llm_client or openai_client or llm.get_llm_client(self.llm_config)
@@ -229,6 +235,32 @@ class QueryEngine:
         """
         history = history or []
         decision = self._route(question, history)
+        return self.answer_from_decision(question, decision, history)
+
+    def answer_from_decision(
+        self,
+        question: str,
+        decision: RouteDecision,
+        history: list[ChatMessage] | None = None,
+    ) -> QueryResult:
+        """
+        Generate an answer from a precomputed RouteDecision, without re-routing.
+
+        Used by `query_structured` (which internally calls `_route` and then
+        this) and by `scripts/eval_routing.py` to avoid routing twice — the
+        eval script measures the route decision separately and then needs the
+        answer generated from that exact decision, not a fresh re-route.
+
+        Args:
+            question: The raw user question (used for answer generation).
+            decision: A RouteDecision already computed by `_route`.
+            history: Prior conversation turns (optional).
+
+        Returns a QueryResult whose `route` matches `decision.route` and whose
+        `sources` align by position with the `SOURCE {i}` blocks the model was
+        shown.
+        """
+        history = history or []
 
         if decision.route == "author":
             answer, sources = self._answer_author(

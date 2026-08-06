@@ -42,7 +42,7 @@ ROUTES = ("cembrowski", "nih", "meta", "author")
 # with no content. On a thinking model that means reasoning ate the whole
 # max_tokens budget, which silently routes every question to "cembrowski" -- so
 # this is counted separately and reported even when accuracy happens to look OK.
-EMPTY_LABEL_MARKER = "returned no content"
+EMPTY_LABEL_MARKER = "Classifier returned no content"
 
 CITATION_RE = re.compile(r"\[(\d+)\]")
 
@@ -68,12 +68,23 @@ def retry_delay(error: Exception, attempt: int) -> float:
     return min(2.0 * (2 ** (attempt - 1)), RETRY_BACKOFF_CAP_SECONDS)
 
 
-def answer_with_retry(engine, question: str):
-    """Run the full pipeline, backing off through rate limits."""
+def answer_with_retry(engine, question: str, decision):
+    """
+    Generate an answer from a precomputed RouteDecision, backing off through
+    rate limits.
+
+    Takes a `decision` already computed by `_route` to avoid routing twice —
+    the caller measured that decision separately and needs the answer generated
+    from exactly that route, not a fresh re-route.
+    """
     for attempt in range(1, GENERATE_RETRIES + 1):
         try:
-            return engine.query_structured(question)
+            return engine.answer_from_decision(question, decision)
         except Exception as e:
+            error_msg = str(e).lower()
+            # Only retry rate-limit errors; re-raise everything else immediately
+            if "rate" not in error_msg and "limit" not in error_msg and "429" not in error_msg:
+                raise
             if attempt == GENERATE_RETRIES:
                 raise
             delay = retry_delay(e, attempt)
@@ -117,10 +128,15 @@ class Case:
 
 def load_cases(path: Path, groups: list[str] | None) -> list[Case]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    cases = [
-        Case(group=q["group"], expected=q["expected"], question=q["question"])
-        for q in data["questions"]
-    ]
+    cases = []
+    for q in data["questions"]:
+        expected = q["expected"]
+        if expected not in ROUTES:
+            sys.exit(
+                f"Invalid expected route '{expected}' for question: {q['question'][:60]}...\n"
+                f"Expected must be one of {ROUTES}"
+            )
+        cases.append(Case(group=q["group"], expected=expected, question=q["question"]))
     if groups:
         cases = [c for c in cases if c.group in groups]
     if not cases:
@@ -161,7 +177,7 @@ def check_citations(answer: str, n_sources: int) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
-def print_report(cases: list[Case], empty_labels: int, full: bool) -> bool:
+def print_report(cases: list[Case], empty_labels: int, full: bool, score_threshold: float) -> bool:
     by_group: dict[str, list[Case]] = {}
     for c in cases:
         by_group.setdefault(c.group, []).append(c)
@@ -198,7 +214,7 @@ def print_report(cases: list[Case], empty_labels: int, full: bool) -> bool:
         corpus = [c.top_score for c in scored if c.expected == "cembrowski"]
         other = [c.top_score for c in scored if c.expected != "cembrowski"]
         print("\n" + "-" * 78)
-        print("TOP-HIT QDRANT SCORES  (SCORE_THRESHOLD gates cembrowski at 0.30)")
+        print(f"TOP-HIT QDRANT SCORES  (SCORE_THRESHOLD gates cembrowski at {score_threshold:.2f})")
         print("-" * 78)
         if corpus:
             print(f"  corpus questions : min={min(corpus):.3f}  max={max(corpus):.3f}  n={len(corpus)}")
@@ -255,11 +271,13 @@ def main() -> None:
 
     from chat_cembrowski.data.vectordb import get_qdrant_client, get_voyage_client
     from chat_cembrowski.retrieval import llm
-    from chat_cembrowski.retrieval.query_engine import QueryEngine
+    from chat_cembrowski.retrieval.query_engine import QueryEngine, SCORE_THRESHOLD
 
     logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(name)s: %(message)s")
     counter = _EmptyCompletionCounter()
-    logging.getLogger("chat_cembrowski.retrieval.query_engine").addHandler(counter)
+    qe_logger = logging.getLogger("chat_cembrowski.retrieval.query_engine")
+    qe_logger.setLevel(logging.WARNING)
+    qe_logger.addHandler(counter)
 
     config = llm.get_config()
     cases = load_cases(Path(args.questions), args.group)
@@ -290,7 +308,7 @@ def main() -> None:
         case.matched_author = decision.matched_author
 
         if args.full:
-            result = answer_with_retry(engine, case.question)
+            result = answer_with_retry(engine, case.question, decision)
             case.answer = result.answer
             case.n_sources = len(result.sources)
             case.citation_errors, case.citation_warnings = check_citations(
@@ -300,7 +318,7 @@ def main() -> None:
         mark = "ok  " if case.ok else "FAIL"
         print(f"  [{i:>2}/{len(cases)}] {mark} {case.expected:>10} -> {case.actual:<10} {case.question[:52]}")
 
-    clean = print_report(cases, counter.count, args.full)
+    clean = print_report(cases, counter.count, args.full, SCORE_THRESHOLD)
 
     if args.save:
         Path(args.save).write_text(

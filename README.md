@@ -1,4 +1,4 @@
-﻿RAG Query System for answering questions based on George Cembrowski's publications and related documents.
+﻿# RAG Query System for answering questions based on George Cembrowski's publications and related documents.
 
 ## Installation
 
@@ -176,7 +176,7 @@ The system retrieves across papers, images, and documents in a single search. Th
 
 Routing is the single point of failure in this system: a question misfiled as `general` skips retrieval entirely, so no amount of good indexing rescues it. `scripts/eval_routing.py` runs a labeled question set (`scripts/eval_questions.json`) through `QueryEngine._route` and reports per-route accuracy, a confusion table, top-hit Qdrant scores, and the count of empty classifier completions.
 
-```
+```bash
 uv run scripts/eval_routing.py                      # routing only — fractions of a cent, seconds
 uv run scripts/eval_routing.py --provider openai    # compare providers on the same set
 uv run scripts/eval_routing.py --group poster book  # one or more groups
@@ -186,7 +186,7 @@ uv run scripts/eval_routing.py --save results.json  # for diffing runs
 
 Routing costs one cheap classifier call plus a Qdrant search per question and no synthesis, so a full run is cheap enough to do on every change. `--full` additionally generates every answer and verifies citation integrity — that every `[i]` resolves to a real source and no unparseable `[1-3]` forms appear — which is slower and costs real tokens.
 
-`--full` fires synthesis calls back to back and will exhaust a tokens-per-minute allowance that production never approaches, since the site answers one question at a time. The OpenAI key is capped at 30k TPM for `gpt-4.1` and each call is ~5k in plus up to 2k out, so `--provider openai --full` rate-limits within a few questions; the script backs off on the server's own "try again in Xs" hint and continues, which makes that run slow but reliable.
+`--full` fires synthesis calls back to back and will exhaust a tokens-per-minute allowance that production never approaches, since the site answers one question at a time. The OpenAI key is capped at 30k TPM for `gpt-4.1` (measured on the current organization account as of early 2025; this limit is environment-specific and depends on usage tier) and each call is ~5k in plus up to 2k out, so `--provider openai --full` rate-limits within a few questions; the script backs off on the server's own "try again in Xs" hint and continues, which makes that run slow but reliable.
 
 Exit code is 0 only when routing is perfect, no classifier completion came back empty, and no answer contains a dead citation.
 
