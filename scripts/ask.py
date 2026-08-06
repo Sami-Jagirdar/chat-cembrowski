@@ -2,12 +2,12 @@ import argparse
 import logging
 
 from chat_cembrowski.data.vectordb import (
-    get_openai_client,
     get_qdrant_client,
     get_voyage_client,
     COLLECTION_NAME,
 )
 
+from chat_cembrowski.retrieval import llm
 from chat_cembrowski.retrieval.query_engine import QueryEngine
 
 
@@ -30,12 +30,12 @@ def main() -> None:
     args = parser.parse_args()
 
     qdrant_client = get_qdrant_client()
-    openai_client = get_openai_client()
+    llm_client = llm.get_llm_client()
     voyage_client = get_voyage_client()
 
     engine = QueryEngine(
         qdrant_client=qdrant_client,
-        openai_client=openai_client,
+        llm_client=llm_client,
         voyage_client=voyage_client,
         top_k=10,
         collection_name=args.collection,

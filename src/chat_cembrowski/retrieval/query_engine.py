@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import voyageai
@@ -11,7 +12,7 @@ from chat_cembrowski.data.vectordb import (
     EMBEDDING_MODEL,
 )
 
-from . import authors, nih
+from . import authors, llm, nih
 from .nih import NIHResult
 from .prompts import (
     CLASSIFIER_PROMPT,
@@ -21,12 +22,32 @@ from .prompts import (
     SYSTEM_PROMPT,
 )
 
+logger = logging.getLogger(__name__)
+
 # A single prior turn: {"role": "user" | "assistant", "content": str}. Already
 # the OpenAI message shape, so it drops straight into a `messages` list.
 ChatMessage = dict[str, str]
 
-CHAT_MODEL = "gpt-4.1"
-CLASSIFIER_MODEL = "gpt-4.1-mini"
+# Token ceilings for the three kinds of call. These are caps, not reservations
+# -- you are billed for what is generated, so headroom is free.
+#
+# The generosity is deliberate. Thinking models (Gemini 2.5+ and all of 3.x)
+# count reasoning tokens against `max_tokens`, and when the budget runs out
+# during reasoning the response comes back with empty content and no exception.
+# The classifier used to cap at 5, which is ample for the single word it emits
+# but is consumed entirely by reasoning on such a model -- yielding an empty
+# label that silently defaulted every question to "cembrowski". 512 cannot be
+# starved, and a one-word answer still only bills for a handful of tokens.
+CLASSIFIER_MAX_TOKENS = 512
+CONDENSE_MAX_TOKENS = 512
+ANSWER_MAX_TOKENS = 2048
+
+# Shown when the model returns an empty completion. Rare, but a blank string is
+# worse than saying so -- it reads as the assistant ignoring the question.
+EMPTY_ANSWER_FALLBACK = (
+    "I wasn't able to generate an answer for that. Please try rephrasing your "
+    "question."
+)
 
 # Minimum top-hit Qdrant cosine score to trust the Cembrowski corpus for a
 # question classified as Cembrowski-specific. Below this, retrieval is too
@@ -106,21 +127,57 @@ class SourceRef:
 class QueryResult:
     """Answer plus the ordered sources it was grounded in and the route taken."""
     answer: str
-    route: str              # "cembrowski" or "nih"
+    route: str              # "author", "meta", "cembrowski", or "nih"
     sources: list[SourceRef] = field(default_factory=list)
+
+
+@dataclass
+class RouteDecision:
+    """
+    Where a question was routed, plus everything gathered on the way there.
+
+    Routing is separated from answering so it can be measured on its own: it
+    costs one cheap classifier call and a Qdrant search, while generating an
+    answer costs a full synthesis call. `scripts/eval_routing.py` exercises
+    `QueryEngine._route` directly, which makes a whole-corpus routing check
+    cheap enough to run on every change rather than once a quarter.
+    """
+    route: str                      # "author", "meta", "cembrowski", or "nih"
+    search_question: str            # the condensed, standalone form used for retrieval
+    label: str | None = None        # raw classifier label; None when an author match short-circuited it
+    matched_author: str | None = None
+    chunks: list[RetrievedChunk] = field(default_factory=list)
+    top_score: float | None = None  # None when retrieval never ran or returned nothing
 
 
 class QueryEngine:
     def __init__(
         self,
         qdrant_client: QdrantClient,
-        openai_client: OpenAI,
-        voyage_client: voyageai.Client, # type: ignore
+        llm_client: OpenAI | None = None,
+        voyage_client: voyageai.Client | None = None, # type: ignore
         top_k: int = 10,
         collection_name: str = COLLECTION_NAME,
+        llm_config: llm.LLMConfig | None = None,
+        openai_client: OpenAI | None = None,
     ) -> None:
+        """
+        Args:
+            llm_client:      Chat client, built from the environment when omitted
+                             (see `retrieval/llm.py`). It is an OpenAI-SDK client
+                             either way -- OpenRouter speaks the same schema, so
+                             the provider difference is a base URL, not a type.
+            llm_config:      Provider/model selection; read from env when omitted.
+            openai_client:   Deprecated alias for `llm_client`. Kept because the
+                             website backend constructs QueryEngine by keyword
+                             and would break on deploy without it.
+        """
+        if voyage_client is None:
+            raise ValueError("voyage_client is required.")
+
         self.qdrant = qdrant_client
-        self.openai = openai_client
+        self.llm_config = llm_config or llm.get_config()
+        self.llm = llm_client or openai_client or llm.get_llm_client(self.llm_config)
         self.voyage = voyage_client
         self.top_k = top_k
         self.collection_name = collection_name
@@ -149,25 +206,18 @@ class QueryEngine:
         """
         End-to-end RAG query pipeline with source routing and structured sources.
 
-        Steps:
-        0. If there's prior conversation, condense the follow-up into a
-           standalone question (cheap LLM call) — used for classification,
-           embedding, and search so context-dependent follow-ups (e.g. "what
-           about in women?") still retrieve correctly.
-        1. Check the (standalone) question against every author name known to
-           the corpus (fuzzy match, no LLM call). A confident hit answers
-           from that person's works across the corpus (metadata filter, not
-           vector search — author names are never embedded) and skips
-           classification entirely.
-        2. Otherwise, classify the question as "cembrowski", "general", or
-           "meta" (cheap LLM call).
-        2. If "meta" (a question about the site/assistant itself, not a
-           health/research topic): answer with the static META_ANSWER —
-           no retrieval at all, Cembrowski or NIH.
-        3. If "cembrowski": embed + search Qdrant. If the top hit clears
-           SCORE_THRESHOLD, answer from the Cembrowski corpus.
-        4. Otherwise (classified "general", or Cembrowski retrieval was too
-           weak to trust): answer from NIH (MedlinePlus + PubMed).
+        `_route` picks the route (see there for how); this method generates the
+        answer for whichever one it chose:
+
+        - "author" — a fuzzy hit on a name known to the corpus. Answers from
+          that person's works across the corpus via a metadata filter rather
+          than vector search, since author names are never embedded.
+        - "meta" — a question about the site/assistant itself. Answers with the
+          static META_ANSWER, with no retrieval at all.
+        - "cembrowski" — retrieval cleared SCORE_THRESHOLD; answer from the
+          corpus chunks `_route` already fetched.
+        - "nih" — classified "general", or Cembrowski retrieval was too weak to
+          trust. Answers from MedlinePlus + PubMed.
 
         The raw `question` (plus `history`) is what's sent to the model for
         answer generation, so phrasing and tone stay natural; only retrieval
@@ -178,36 +228,79 @@ class QueryEngine:
         citation in the answer maps straight to `sources[i - 1]`.
         """
         history = history or []
+        decision = self._route(question, history)
+
+        if decision.route == "author":
+            answer, sources = self._answer_author(
+                question, decision.matched_author or "", history
+            )
+        elif decision.route == "meta":
+            return QueryResult(answer=META_ANSWER, route="meta", sources=[])
+        elif decision.route == "cembrowski":
+            answer, sources = self._answer_cembrowski(
+                question, decision.chunks, history
+            )
+        else:
+            answer, sources = self._answer_nih(
+                question, history, decision.search_question
+            )
+
+        return QueryResult(answer=answer, route=decision.route, sources=sources)
+
+    def _route(
+        self, question: str, history: list[ChatMessage] | None = None
+    ) -> RouteDecision:
+        """
+        Decide which source a question should be answered from, without
+        generating anything. See `query_structured` for what each route means.
+
+        Split out from `query_structured` so routing can be evaluated on its
+        own -- see RouteDecision.
+        """
+        history = history or []
         search_question = (
             self._condense_question(question, history) if history else question
         )
 
         matched_author = self._match_author(search_question)
         if matched_author:
-            answer, sources = self._answer_author(question, matched_author, history)
-            return QueryResult(answer=answer, route="author", sources=sources)
+            return RouteDecision(
+                route="author",
+                search_question=search_question,
+                matched_author=matched_author,
+            )
 
         label = self._classify(search_question)
 
         if label == "meta":
-            return QueryResult(answer=META_ANSWER, route="meta", sources=[])
-
-        if label != "general":
-            query_embedding = self._embed_query(search_question)
-            retrieved_chunks = self._search(query_embedding)
-
-            strong_match = (
-                bool(retrieved_chunks)
-                and retrieved_chunks[0].score >= SCORE_THRESHOLD
+            return RouteDecision(
+                route="meta", search_question=search_question, label=label
             )
-            if strong_match:
-                answer, sources = self._answer_cembrowski(
-                    question, retrieved_chunks, history
-                )
-                return QueryResult(answer=answer, route="cembrowski", sources=sources)
 
-        answer, sources = self._answer_nih(question, history, search_question)
-        return QueryResult(answer=answer, route="nih", sources=sources)
+        # A "general" label skips retrieval entirely -- there is no safety net in
+        # that direction, by design. A "cembrowski" label still has to earn the
+        # route by clearing SCORE_THRESHOLD, so a misclassification or a genuine
+        # gap in the corpus falls through to NIH.
+        if label == "general":
+            return RouteDecision(
+                route="nih", search_question=search_question, label=label
+            )
+
+        chunks = self._search(self._embed_query(search_question))
+        top_score = chunks[0].score if chunks else None
+        route = (
+            "cembrowski"
+            if top_score is not None and top_score >= SCORE_THRESHOLD
+            else "nih"
+        )
+
+        return RouteDecision(
+            route=route,
+            search_question=search_question,
+            label=label,
+            chunks=chunks,
+            top_score=top_score,
+        )
 
     def _condense_question(
         self, question: str, history: list[ChatMessage]
@@ -223,10 +316,10 @@ class QueryEngine:
         than breaking the request.
         """
         try:
-            response = self.openai.chat.completions.create(
-                model=CLASSIFIER_MODEL,
+            response = self.llm.chat.completions.create(
+                model=self.llm_config.classifier_model,
                 temperature=0,
-                max_tokens=256,
+                max_tokens=CONDENSE_MAX_TOKENS,
                 messages=[
                     {"role": "system", "content": CONDENSE_PROMPT},
                     *history, # type: ignore
@@ -235,12 +328,23 @@ class QueryEngine:
                         "content": f"Follow-up question: {question}\n\nStandalone question:",
                     },
                 ],
+                **llm.completion_extras(
+                    self.llm_config, effort=llm.CLASSIFIER_REASONING_EFFORT
+                ),
             )
             standalone = (response.choices[0].message.content or "").strip()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Condense call failed ({e}); using the raw question.")
             return question
 
-        return standalone or question
+        if not standalone:
+            logger.warning(
+                "Condense returned no content "
+                f"(model={self.llm_config.classifier_model}); using the raw question."
+            )
+            return question
+
+        return standalone
 
     def _classify(self, question: str) -> str:
         """
@@ -248,24 +352,47 @@ class QueryEngine:
         cheap LLM call.
 
         Defaults to "cembrowski" on any API failure or an unrecognized
-        label — the retrieval-score check in `query_structured` still
-        catches weak/off-topic matches and routes them to NIH, so failing
-        open here doesn't bypass that fallback. (Never defaults to "meta":
-        that route skips retrieval entirely, so a wrong "meta" guess would
-        leave the answer stuck with a canned response.)
+        label — the retrieval-score check in `_route` still catches
+        weak/off-topic matches and routes them to NIH, so failing open here
+        doesn't bypass that fallback. (Never defaults to "meta": that route
+        skips retrieval entirely, so a wrong "meta" guess would leave the
+        answer stuck with a canned response.)
+
+        An empty completion is logged rather than quietly falling through the
+        label checks. It looks identical to a real "cembrowski" classification
+        from the outside, so without the warning a starved thinking model
+        (see CLASSIFIER_MAX_TOKENS) would route every question to the corpus
+        and give no sign of it.
         """
         try:
-            response = self.openai.chat.completions.create(
-                model=CLASSIFIER_MODEL,
+            response = self.llm.chat.completions.create(
+                model=self.llm_config.classifier_model,
                 temperature=0,
-                max_tokens=5,
+                max_tokens=CLASSIFIER_MAX_TOKENS,
                 messages=[
                     {"role": "system", "content": CLASSIFIER_PROMPT},
                     {"role": "user", "content": question},
                 ],
+                **llm.completion_extras(
+                    self.llm_config, effort=llm.CLASSIFIER_REASONING_EFFORT
+                ),
             )
-            label = (response.choices[0].message.content or "").strip().lower()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Classifier call failed ({e}); defaulting to 'cembrowski'.")
+            return "cembrowski"
+
+        choice = response.choices[0]
+        label = (choice.message.content or "").strip().lower()
+
+        if not label:
+            logger.warning(
+                "Classifier returned no content "
+                f"(model={self.llm_config.classifier_model}, "
+                f"finish_reason={choice.finish_reason!r}); defaulting to "
+                "'cembrowski'. On a thinking model this means reasoning consumed "
+                "the whole max_tokens budget — raise CLASSIFIER_MAX_TOKENS or "
+                "lower LLM_REASONING_EFFORT."
+            )
             return "cembrowski"
 
         if "meta" in label:
@@ -299,12 +426,31 @@ class QueryEngine:
         background = self._build_background_context(background_chunks)
         sources = self._cembrowski_sources(citable_chunks)
 
-        user_content = f"""
+        if context:
+            user_content = f"""
 Question:
 {question}
 
 Context:
 {context}
+"""
+        else:
+            # Nothing retrieved has a reader-facing link, so there are no
+            # numbered SOURCE blocks at all. Saying so explicitly matters: an
+            # empty "Context:" heading followed by a rich background section
+            # reads as an oversight, and the model fills the gap by inventing
+            # [1], [2], ... that resolve to nothing. This is the common case for
+            # the textbook, which is unlinked and is most of the corpus.
+            user_content = f"""
+Question:
+{question}
+
+Context:
+(none — no citable sources were retrieved for this question)
+
+There are NO numbered sources for this question. Do not write any bracket
+citation such as [1]; there is nothing for it to point at. Answer using the
+background material below.
 """
         if background:
             user_content += f"""
@@ -312,24 +458,46 @@ Additional background (not citable — do not cite these with a bracket number, 
 {background}
 """
 
-        response = self.openai.chat.completions.create(
-            model=CHAT_MODEL,
+        return self._generate(SYSTEM_PROMPT, user_content, history), sources
+
+    def _generate(
+        self,
+        system_prompt: str,
+        user_content: str,
+        history: list[ChatMessage] | None = None,
+    ) -> str:
+        """
+        Run one synthesis call and return the answer text.
+
+        Shared by both answering paths, which differ only in their system prompt
+        and the context block they assemble. API failures propagate to the
+        caller; only an empty completion is handled here, since that comes back
+        as a success and would otherwise reach the reader as a blank answer.
+        """
+        response = self.llm.chat.completions.create(
+            model=self.llm_config.chat_model,
             temperature=0.1,
-            max_tokens=1500,
+            max_tokens=ANSWER_MAX_TOKENS,
             messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
+                {"role": "system", "content": system_prompt},
                 *(history or []), # type: ignore
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
+                {"role": "user", "content": user_content},
             ],
+            **llm.completion_extras(self.llm_config),
         )
 
-        return response.choices[0].message.content or "", sources
+        choice = response.choices[0]
+        answer = (choice.message.content or "").strip()
+
+        if not answer:
+            logger.error(
+                "Synthesis returned no content "
+                f"(model={self.llm_config.chat_model}, "
+                f"finish_reason={choice.finish_reason!r})."
+            )
+            return EMPTY_ANSWER_FALLBACK
+
+        return answer
 
     def _build_background_context(self, chunks: list[RetrievedChunk]) -> str:
         """
@@ -474,30 +642,15 @@ Additional background (not citable — do not cite these with a bracket number, 
             for i, result in enumerate(results, start=1)
         ]
 
-        response = self.openai.chat.completions.create(
-            model=CHAT_MODEL,
-            temperature=0.1,
-            max_tokens=1500,
-            messages=[
-                {
-                    "role": "system",
-                    "content": NIH_SYSTEM_PROMPT,
-                },
-                *(history or []), # type: ignore
-                {
-                    "role": "user",
-                    "content": f"""
+        user_content = f"""
 Question:
 {question}
 
 Context:
 {context}
-""",
-                },
-            ],
-        )
+"""
 
-        return response.choices[0].message.content or "", sources
+        return self._generate(NIH_SYSTEM_PROMPT, user_content, history), sources
 
     def _embed_query(self, question: str) -> list[float]:
         result = self.voyage.multimodal_embed(

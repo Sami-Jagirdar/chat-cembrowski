@@ -16,8 +16,14 @@ uv run -m chat_cembrowski.data.image_extractor      # 3. Extract images → data
 uv run -m chat_cembrowski.data.doc_ingestion        # 4. Ingest docs from data/docs/ → data/doc_json/
 uv run -m chat_cembrowski.data.vectordb             # 5. Chunk + embed + upsert papers, images, and docs to Qdrant
 
-# Target the live production collection (the default in code is 'cembrowski')
-uv run -m chat_cembrowski.data.vectordb --collection BAPa-V1
+# Target a non-default collection (the code default is the production 'BAPa-V1')
+uv run -m chat_cembrowski.data.vectordb --collection some-other-collection
+
+# Routing eval — run after any change to CLASSIFIER_PROMPT, the corpus,
+# SCORE_THRESHOLD, the embedding model, or the chunking strategy
+uv run scripts/eval_routing.py                      # routing only: cheap and fast
+uv run scripts/eval_routing.py --provider openai    # A/B the two providers
+uv run scripts/eval_routing.py --full               # + answers and citation integrity
 
 # Ingest a scanned (image-only) PDF. --method auto detects the missing text
 # layer; the flags below trim loose material captured alongside the work.
@@ -37,7 +43,9 @@ uv run scripts/link_posters.py --apply    # write site_path + poster_id
 
 ## Architecture
 
-This is a RAG (Retrieval-Augmented Generation) system that answers questions about George Cembrowski's research papers and related documents. It uses **Qdrant** for vector storage, **Voyage AI voyage-multimodal-3.5** (1024-dim) for embeddings, and **gpt-4.1** for answer synthesis (gpt-4.1-mini for query classification/routing).
+This is a RAG (Retrieval-Augmented Generation) system that answers questions about George Cembrowski's research papers and related documents. It uses **Qdrant** for vector storage, **Voyage AI voyage-multimodal-3.5** (1024-dim) for embeddings, and **Gemini via OpenRouter** for answer synthesis — `gemini-3.6-flash` for answers, `gemini-3.5-flash-lite` for classification/condensing. See "LLM provider" below and the README section "Which models the assistant uses, and why".
+
+The **data pipeline still calls OpenAI directly** (OCR in `data/ocr.py`, metadata extraction in `data/ingestion.py`), so `OPENAI_API_KEY` is required regardless of `LLM_PROVIDER`. Only the retrieval path is switchable.
 
 General medical questions that fall outside Cembrowski's corpus are routed to NIH/NLM sources (MedlinePlus + PubMed) instead of the Cembrowski papers — see "Query routing" below.
 
@@ -56,11 +64,16 @@ src/chat_cembrowski/
     serialization.py # JSON read/write for Paper and Document objects
     vectordb.py      # Qdrant client, Voyage AI embedding, batch upsert
   retrieval/         # Query interface
-    query_engine.py  # Classify → route to Cembrowski (Qdrant) or NIH → build context → generate with GPT-4.1
+    llm.py           # Provider factory (OpenRouter/OpenAI), model config, reasoning-effort control
+    query_engine.py  # Classify → route to Cembrowski (Qdrant) or NIH → build context → generate
     prompts.py       # System prompts (Cembrowski, NIH) + classifier prompt + citation formatting rules
     nih.py           # MedlinePlus + PubMed (NCBI E-utilities) search clients for general medical questions
+    authors.py       # Fuzzy author-name matching + payload-filtered chunk fetch (no LLM calls)
 scripts/
   ask.py                    # CLI entry point for asking questions
+  chat.py                   # Interactive multi-turn REPL
+  eval_routing.py           # Routing eval — see "Routing eval" below
+  eval_questions.json       # Labeled question set backing eval_routing.py
   reset_paper_processed.py  # Resets Paper.processed to False
 data/
   papers/     # PDF source files (gitignored, kept locally)
@@ -84,12 +97,40 @@ extras/       # Miscellaneous files not part of the pipeline (gitignored)
 5. **ocr.py** — Fallback for PDFs with no text layer. `has_text_layer()` samples pages to detect a scan; `ocr_pdf()` renders each page and transcribes it with GPT-4.1 vision, returning markdown in the same per-page shape `parser.parse_pdf_for_pages()` produces. `ocr_leading_text()` is the same treatment for a scanned cover, so `ingest_local_pdfs` can still recover title/authors/year. See "Scanned PDFs" below.
 6. **vectordb.py** — Embeds and upserts all unprocessed content into Qdrant: paper text chunks (text batches of 64), image chunks (multimodal image+text pairs, batches of 16), and document text chunks. Uses Voyage AI `voyage-multimodal-3.5`. Sets `processed = True` on success.
 
+### LLM provider (`retrieval/llm.py`)
+
+Both providers speak the OpenAI chat-completions schema — OpenRouter natively — so the OpenAI
+SDK is already the abstraction layer and swapping providers is a `base_url` plus a model string.
+`llm.get_config()` reads the environment; `llm.get_llm_client()` builds the client.
+
+- `LLM_PROVIDER` — `openrouter` (default) or `openai`. Setting `openai` is the one-line rollback
+  to `gpt-4.1` / `gpt-4.1-mini`. An unrecognized value raises rather than falling back, so a typo
+  fails at startup instead of sending traffic somewhere unintended.
+- `CHAT_MODEL` / `CLASSIFIER_MODEL` — override the per-provider defaults.
+- `LLM_REASONING_EFFORT` — thinking budget for synthesis (`none`…`xhigh`, default `minimal`).
+  The classifier and condenser are pinned to `llm.CLASSIFIER_REASONING_EFFORT` and ignore it, so
+  raising the global setting can't quietly add seconds to every query's critical path.
+
+`llm.completion_extras(config, effort=...)` returns the `extra_body` reasoning block on
+OpenRouter and `{}` on OpenAI (which rejects unknown body fields), so call sites splat it
+unconditionally.
+
+**Thinking models make `max_tokens` a correctness concern, not just a cost knob.** Gemini 2.5+
+and all of 3.x count reasoning tokens against `max_tokens` and bill them as output. A budget too
+small to cover the thinking is spent entirely on it, and the call returns **empty content with
+no exception** — a success, as far as the SDK is concerned. `_classify` capped at 5 tokens
+originally, which is ample for the single word it emits and instantly fatal here: an empty label
+matches neither `"meta"` nor `"general"` and falls through to the `"cembrowski"` default, sending
+every question to the corpus with no error anywhere. Hence `CLASSIFIER_MAX_TOKENS = 512` and
+friends (ceilings, not reservations — headroom is free), plus explicit empty-completion logging
+in `_classify` and `_generate`.
+
 ### Qdrant configuration
 
-- **Collection**: `BAPa-V1` in production — this is what the website's backend reads and what
-  `scripts/link_posters.py` defaults to. `vectordb.COLLECTION_NAME` still defaults to
-  `cembrowski`, so **any ingestion run against production must pass `--collection BAPa-V1`**
-  or it will silently create and populate a second, unread collection.
+- **Collection**: `BAPa-V1` in production — this is what the website's backend reads, what
+  `scripts/link_posters.py` defaults to, and what `vectordb.COLLECTION_NAME` is set to, so
+  the pipeline targets production by default. Pass `--collection <name>` to work against
+  anything else.
 - **Vector dims**: 1024 (Cosine distance)
 - **Local mode**: If no `QDRANT_CLUSTER_ENDPOINT` is set, uses embedded local DB at `data/vectors/`
 - **Cloud mode**: Set `QDRANT_CLUSTER_ENDPOINT` + `QDRANT_API_KEY` in `.env`
@@ -161,14 +202,28 @@ Matching uses the same `normalize()` as `frontend/lib/citations.ts`. The corpus 
 - Searches Qdrant for top-10 chunks (`query_points`)
 - Routes retrieved points by `chunk_category` (image) and `source_type` (document vs paper)
 - Builds a numbered context block (`SOURCE 1`, `SOURCE 2`, …). The model cites by bracketed number only — `[1]`, `[2]` — matching those blocks; the frontend resolves each number to a link via the aligned `sources` list. The model never writes titles or URLs as citations.
-- Calls `gpt-4.1` with a system prompt enforcing ground-in-context answers and markdown output
+- Calls the configured chat model with a system prompt enforcing ground-in-context answers and markdown output
+
+**Only chunks with a `site_path` become numbered SOURCE blocks.** `_answer_cembrowski` splits
+retrieval into `citable` (a linked poster) and `background` (documents, the textbook, and
+posters `link_posters.py` hasn't matched), so the reader-facing source list is never handed
+something unclickable. Background still informs the answer but carries no number.
+
+Note the consequence: the textbook is unlinked and is most of the corpus, so a book-answered
+question routinely has **zero** citable sources. When that happens the user message says so
+explicitly instead of leaving an empty `Context:` heading — otherwise the model reads the gap
+as an oversight and invents `[1]`, `[2]`, … that resolve to nothing. `SYSTEM_PROMPT` rule 9
+states the same constraint. `scripts/eval_routing.py --full` checks for exactly this.
 
 ### Query routing (Cembrowski vs. NIH)
 
 Non-technical site visitors may ask general medical questions unrelated to Cembrowski's own research; per the client's direction, those are answered from NIH sources instead of being refused.
 
-`QueryEngine.query_with_route()` decides per-question:
-1. **Classify** — a cheap `gpt-4.1-mini` call (`_classify`, prompt in `prompts.CLASSIFIER_PROMPT`) labels the question `"cembrowski"` or `"general"`. Defaults to `"cembrowski"` on API failure.
+`QueryEngine._route()` decides per-question (and is separated from answer generation precisely so `scripts/eval_routing.py` can measure it without paying for synthesis):
+
+0. **Author match** — before any LLM call, the question is fuzzy-matched against every author name in the corpus (`authors.py`). A confident hit routes to `"author"` and answers from that person's works via a payload filter, skipping classification entirely.
+1. **Classify** — a cheap `gemini-3.5-flash-lite` call (`_classify`, prompt in `prompts.CLASSIFIER_PROMPT`) labels the question `"cembrowski"`, `"general"`, or `"meta"`. Defaults to `"cembrowski"` on API failure or an empty completion — the latter is logged as a warning, because on a thinking model an empty label is indistinguishable from a real classification and would silently send every question to the corpus (see `CLASSIFIER_MAX_TOKENS`).
+1b. **Meta** — a question about the site/assistant itself returns the static `META_ANSWER` with no retrieval at all. Deliberately not LLM-generated: a fixed string can't hallucinate, and before this route existed such questions fell through to a live NIH search that occasionally returned a barely-related health topic as "context".
 2. **Retrieve + score-check** — if labeled `"cembrowski"`, the question is embedded and searched against Qdrant as usual. The top hit's cosine score must clear `SCORE_THRESHOLD` (0.30, in `query_engine.py`) to be trusted; this catches questions that were misclassified or simply aren't covered by the corpus.
 3. **Route** — a strong Cembrowski match is answered via `_answer_cembrowski` (existing `SYSTEM_PROMPT`, cites Cembrowski's papers/documents/images). Everything else — `"general"`-labeled questions, or weak/no Cembrowski matches — is answered via `_answer_nih`.
 
@@ -189,8 +244,17 @@ overlap. Genuine consumer questions reach 0.516 ("what does a high ferritin leve
 health" — it matches the ferritin overdiagnosis poster), while real corpus questions drop to
 0.501. No cutoff separates them. What does separate them is the subject: **is the question about
 THE LABORATORY or about THE PATIENT?** The prompt now draws that line explicitly, with paired
-examples on the same analyte. Measured after the change: 17/17 posters and 12/12 book chapters
-route correctly, and 12/12 consumer health questions still go to NIH.
+examples on the same analyte.
+
+**This is now measured rather than asserted.** `scripts/eval_routing.py` runs a labeled set
+(`scripts/eval_questions.json`: 17 poster, 12 book, 10 consumer, 4 meta, 4 author) through
+`_route` and reports per-route accuracy, a confusion table, top-hit scores, and the count of
+empty classifier completions. Both providers measured on the same set: **47/47 routing and
+47/47 citations clean on each**, 0 empty completions, corpus top-hit scores 0.473-0.769.
+Routing is unaffected by the model swap (retrieval is Voyage/Qdrant); the difference is tail
+latency — median/max 0.74s/1.49s on Gemini vs 0.88s/3.24s on GPT. Re-run after touching this prompt, the corpus, or
+`SCORE_THRESHOLD` — the poster questions are written against the exact titles in `BAPa-V1`, so a
+re-ingestion under a changed title should make them fail.
 
 `_answer_nih` calls `nih.search_nih(question)` (`src/chat_cembrowski/retrieval/nih.py`), which queries:
 - **MedlinePlus Web Service** (`wsearch.nlm.nih.gov`) — primary source; plain-language consumer health topics, no API key needed.
