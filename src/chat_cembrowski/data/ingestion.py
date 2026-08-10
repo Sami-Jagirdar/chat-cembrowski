@@ -3,8 +3,10 @@
     from locally-sourced PDFs by extracting metadata from the first page via LLM.
 '''
 
+import csv
 import json
 import os
+import re
 from dotenv import load_dotenv
 import time
 import logging
@@ -16,6 +18,7 @@ import fitz  # PyMuPDF
 import serpapi
 import requests
 from openai import OpenAI
+from rapidfuzz import fuzz, process, utils
 from . import ocr
 from .models import Paper
 from .serialization import save_paper, save_papers_to_json, load_papers_from_json
@@ -31,6 +34,7 @@ SERPAPI_BASE_URL = "https://serpapi.com/search"
 REQUEST_DELAY = 1  # Delay between requests in seconds
 SERPAPI_AUTHOR_PAGE_SIZE = 100  # Max articles per Google Scholar Author API call
 AUTHOR_TRUNCATION_MARKERS = {"...", "…"}  # SerpAPI's "and more authors" sentinels
+CATALOG_PATH = Path(__file__).resolve().parents[3] / "data" / "catalog.csv"
 
 def _get_author_articles(
         api_key: str,
@@ -171,6 +175,206 @@ def _download_file(url: str, dest_path: Path) -> bool:
             dest_path.unlink()  # Remove incomplete file
         return False
 
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_id(raw: str) -> str:
+    """
+    Turns a Scholar citation_id into a filesystem-safe paper ID.
+
+    citation_ids look like 'j8iA0kAAAAAJ:2osOgNQ5qMEC'. The colon is illegal in
+    Windows filenames and paper IDs become '<id>.json', so it has to go before
+    the ID is ever used as a path component.
+    """
+    cleaned = _UNSAFE_ID_CHARS.sub("_", raw).strip("_")
+    return cleaned or str(uuid.uuid7())
+
+
+def _parse_article(article: dict) -> Optional[Paper]:
+    """
+    Builds a catalog Paper (no PDF yet) from one Google Scholar Author entry.
+
+    Returns None when the entry has no title, which is the only field there is
+    no sensible fallback for.
+    """
+    title: str = article.get("title", "").strip()
+    if not title:
+        logger.warning(f"Article missing title, skipping: {article}")
+        return None
+
+    citation_id: str = article.get("citation_id", "").strip()
+    paper_id = _safe_id(citation_id) if citation_id else str(uuid.uuid7())
+
+    authors_raw: str = article.get("authors", "")
+    authors = [a.strip() for a in authors_raw.split(",") if a.strip()]
+
+    year_raw = str(article.get("year", "")).strip()
+    try:
+        year = int(year_raw) if year_raw else None
+    except (TypeError, ValueError):
+        year = None
+
+    cited_by = article.get("cited_by") or {}
+    citations = cited_by.get("value") if isinstance(cited_by, dict) else None
+
+    return Paper(
+        id=paper_id,
+        source_file="",  # catalog entry: PDF not acquired yet
+        title=title,
+        authors=authors or None,
+        year=year,
+        publication=article.get("publication", "").strip() or None,
+        scholar_link=article.get("link") or None,
+        cited_by=citations,
+        processed=False,
+        text="",
+    )
+
+
+def _write_catalog(papers: list[Paper], catalog_path: Path = CATALOG_PATH) -> Path:
+    """
+    Writes the sourcing checklist: one row per known work, most-cited first.
+
+    This is the artifact the manual acquisition workflow runs on, so it is
+    ordered by citation count rather than by Scholar's ordering — if only part
+    of the corpus can be sourced by hand, the most-cited works are worth doing
+    first.
+    """
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = sorted(papers, key=lambda p: (p.cited_by or 0), reverse=True)
+
+    with open(catalog_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id", "title", "authors", "year", "publication",
+            "cited_by", "have_pdf", "pdf_url", "scholar_link",
+        ])
+        for p in rows:
+            writer.writerow([
+                p.id,
+                p.title or "",
+                "; ".join(p.authors or []),
+                p.year or "",
+                p.publication or "",
+                p.cited_by if p.cited_by is not None else "",
+                "yes" if p.has_pdf else "no",
+                p.pdf_url or "",
+                p.scholar_link or "",
+            ])
+
+    logger.info(f"Wrote catalog of {len(rows)} works to {catalog_path}")
+    return catalog_path
+
+
+def fetch_author_catalog(
+    author_id: str = DEFAULT_AUTHOR_ID,
+    api_key: str = SERPAPI_KEY,
+    num_articles: int = 1000,
+    json_dir: Optional[Path] = None,
+    catalog_path: Path = CATALOG_PATH,
+    with_pdf_links: bool = False,
+    max_lookups: Optional[int] = None,
+) -> list[Paper]:
+    """
+    Discovery without acquisition: records every work the author has, with no
+    PDF download.
+
+    This is the cheap half of ingestion. Paginating the author's full list
+    costs ceil(N/100) SerpAPI searches — 4 for a 332-work profile — whereas
+    resolving a public PDF link costs one search *per article*. Since publisher
+    bot protection blocks nearly all of those downloads anyway, the catalog is
+    usually the only part worth paying for; PDFs are then collected by hand
+    into data/papers/ and attached with ingest_local_pdfs().
+
+    Existing Papers are merged, never clobbered: a catalog re-run refreshes
+    metadata but leaves source_file, text and processed intact on works whose
+    PDF has already been acquired.
+
+    Args:
+        author_id: Google Scholar Author ID
+        api_key: SerpAPI API key
+        num_articles: Upper bound on works to fetch; overshooting is safe
+        json_dir: Where Paper JSONs live (default: data/json)
+        catalog_path: Where to write the CSV checklist (default: data/catalog.csv)
+        with_pdf_links: Also resolve a public PDF URL per work. Costs one
+            SerpAPI search each — off by default for that reason.
+        max_lookups: Cap on those paid lookups, applied to the most-cited works
+            first. None means no cap.
+
+    Returns:
+        The full list of catalog Paper objects.
+    """
+    if not api_key:
+        logger.error("SERPAPI_KEY not set in environment variables.")
+        return []
+
+    if json_dir is None:
+        json_dir = Path(__file__).resolve().parents[3] / "data" / "json"
+
+    articles = _get_author_articles(api_key, author_id, num_articles)
+    existing = {p.id: p for p in load_papers_from_json(json_dir)}
+
+    papers: list[Paper] = []
+    seen_titles: dict[str, str] = {}
+    duplicates = 0
+
+    for article in articles:
+        paper = _parse_article(article)
+        if paper is None:
+            continue
+
+        # Scholar keeps separate records for the same work (abstract vs journal
+        # version), which would otherwise become duplicate Papers and duplicate
+        # chunks in Qdrant.
+        title_key = (paper.title or "").strip().lower()
+        if title_key in seen_titles:
+            duplicates += 1
+            logger.info(f"Duplicate title, skipping: {paper.title}")
+            continue
+        seen_titles[title_key] = paper.id
+
+        # Merge rather than overwrite: never drop an already-acquired PDF.
+        prior = existing.get(paper.id)
+        if prior is not None:
+            paper.source_file = prior.source_file
+            paper.text = prior.text
+            paper.processed = prior.processed
+            paper.first_page_number = prior.first_page_number
+            paper.pdf_url = prior.pdf_url or paper.pdf_url
+            if not _authors_incomplete(prior.authors):
+                paper.authors = prior.authors
+
+        papers.append(paper)
+
+    if with_pdf_links:
+        targets = [p for p in sorted(papers, key=lambda p: (p.cited_by or 0), reverse=True)
+                   if not p.has_pdf and not p.pdf_url]
+        if max_lookups is not None:
+            targets = targets[:max_lookups]
+        logger.info(
+            f"Resolving public PDF links for {len(targets)} work(s) "
+            f"— {len(targets)} SerpAPI searches."
+        )
+        for paper in targets:
+            url, _ = _find_public_resource(paper.title or "", api_key)
+            if url:
+                paper.pdf_url = url
+
+    for paper in papers:
+        save_paper(paper, json_dir)
+
+    _write_catalog(papers, catalog_path)
+
+    with_links = sum(1 for p in papers if p.pdf_url)
+    have_pdf = sum(1 for p in papers if p.has_pdf)
+    logger.info(
+        f"Catalog complete: {len(papers)} works "
+        f"({duplicates} duplicate title(s) skipped), "
+        f"{have_pdf} with a PDF already acquired, {with_links} with a public PDF link."
+    )
+    return papers
+
+
 def fetch_author_papers(
     author_id: str = DEFAULT_AUTHOR_ID,
     api_key: str = SERPAPI_KEY,
@@ -242,7 +446,7 @@ def fetch_author_papers(
             time.sleep(REQUEST_DELAY)
             continue
 
-        paper_id = result_id.strip() if result_id and result_id.strip() else str(uuid.uuid7())
+        paper_id = _safe_id(result_id.strip()) if result_id and result_id.strip() else str(uuid.uuid7())
 
         # Parse Authors (SerpAPI returns authors as comma-separated string)
         authors_raw: str = article.get("authors", "")
@@ -362,6 +566,60 @@ def _extract_metadata_with_llm(first_page_text: str, client: OpenAI) -> dict:
         return {}
 
 
+def _iter_pdfs(papers_dir: Path) -> list[Path]:
+    """
+    Every PDF in papers_dir, matched case-insensitively on all platforms.
+
+    glob("*.pdf") is case-insensitive on Windows because the filesystem is, but
+    case-sensitive on Linux — so a browser-saved "Paper.PDF" is picked up
+    locally and silently ignored once this runs in a container. Publisher sites
+    hand out uppercase extensions often enough that a hand-collected batch
+    would half-ingest with no error at all.
+    """
+    return sorted(
+        p for p in papers_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".pdf"
+    )
+
+
+# rapidfuzz token_set_ratio, 0-100. Titles come from two independent sources
+# (Scholar's listing and the PDF's own first page), which differ in casing,
+# punctuation and trailing subtitles, but a genuine match still shares nearly
+# all its tokens. Set high: a wrong attachment silently files a PDF under
+# another work's citation.
+TITLE_MATCH_THRESHOLD = 92
+
+
+def _match_catalog_entry(title: Optional[str], candidates: list[Paper]) -> Optional[Paper]:
+    """
+    Finds the catalog entry a freshly-downloaded PDF belongs to, by title.
+
+    Returns None when there is no confident match, in which case the caller
+    creates a standalone Paper — an unmatched PDF is a minor annoyance, a
+    mismatched one corrupts a citation.
+    """
+    if not title or not candidates:
+        return None
+
+    titled = [p for p in candidates if p.title]
+    if not titled:
+        return None
+
+    match = process.extractOne(
+        title,
+        [p.title for p in titled],
+        scorer=fuzz.token_set_ratio,
+        processor=utils.default_process,
+        score_cutoff=TITLE_MATCH_THRESHOLD,
+    )
+    if match is None:
+        return None
+
+    _, score, idx = match
+    logger.info(f"Title matched catalog entry (score {score:.0f}): {titled[idx].title}")
+    return titled[idx]
+
+
 def _authors_incomplete(authors: Optional[list[str]]) -> bool:
     """
     True when an author list is missing or visibly truncated.
@@ -407,11 +665,14 @@ def ingest_local_pdfs(
     client = OpenAI(api_key=openai_api_key)
 
     existing_papers = list(load_papers_from_json(json_dir))
-    known_source_files = {p.source_file for p in existing_papers}
+    known_source_files = {p.source_file for p in existing_papers if p.source_file}
+    # Catalog rows awaiting a PDF — a hand-downloaded file should attach to one
+    # of these rather than becoming a second record for the same work.
+    awaiting_pdf = [p for p in existing_papers if not p.has_pdf]
 
     new_papers: list[Paper] = []
 
-    for pdf_path in sorted(papers_dir.glob("*.pdf")):
+    for pdf_path in _iter_pdfs(papers_dir):
         if pdf_path.name in known_source_files:
             continue
 
@@ -423,6 +684,25 @@ def ingest_local_pdfs(
             metadata: dict = {}
         else:
             metadata = _extract_metadata_with_llm(first_page_text, client)
+
+        matched = _match_catalog_entry(metadata.get("title"), awaiting_pdf)
+        if matched is not None:
+            new_filename = f"{matched.id}.pdf"
+            pdf_path.rename(papers_dir / new_filename)
+            logger.info(
+                f"Attached {pdf_path.name} → catalog entry '{matched.title}' ({new_filename})"
+            )
+            matched.source_file = new_filename
+            # Trust the PDF over Scholar for these two, per _extract_metadata_with_llm.
+            if metadata.get("authors"):
+                matched.authors = metadata["authors"]
+            if metadata.get("first_page_number") is not None:
+                matched.first_page_number = metadata["first_page_number"]
+            save_paper(matched, json_dir)
+            awaiting_pdf.remove(matched)
+            known_source_files.add(new_filename)
+            new_papers.append(matched)
+            continue
 
         paper_id = str(uuid.uuid7())
         new_filename = f"{paper_id}.pdf"
@@ -442,6 +722,7 @@ def ingest_local_pdfs(
         )
         save_paper(paper, json_dir)
         new_papers.append(paper)
+        known_source_files.add(new_filename)
         logger.info(f"Created Paper: {paper.title}")
 
     # Patch existing papers missing first_page_number or with truncated authors
@@ -499,8 +780,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["ingest_local"],
-        help="Use 'ingest_local' to create Paper objects from locally-sourced PDFs.",
+        choices=["ingest_local", "catalog"],
+        help=(
+            "'ingest_local' creates Paper objects from locally-sourced PDFs. "
+            "'catalog' records every work the author has without downloading "
+            "anything (ceil(N/100) SerpAPI searches total)."
+        ),
     )
     parser.add_argument(
         "--author-id",
@@ -510,11 +795,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-articles",
         type=int,
-        default=25,
+        default=None,
         help=(
-            "Maximum number of articles to fetch (default: 25). Results are "
-            "paginated, so a value larger than the author's publication count "
-            "simply fetches everything. Costs ~1 SerpAPI credit per article."
+            "Maximum number of articles to fetch (default: 25 when downloading, "
+            "1000 in catalog mode — i.e. everything). Results are paginated, so "
+            "a value larger than the author's publication count simply fetches "
+            "everything."
         ),
     )
     parser.add_argument(
@@ -530,15 +816,53 @@ if __name__ == "__main__":
             "registered paper, not just visibly truncated ones."
         ),
     )
+    parser.add_argument(
+        "--with-pdf-links",
+        action="store_true",
+        help=(
+            "catalog only: also resolve a public PDF URL per work. Costs ONE "
+            "SerpAPI search per article — use --max-lookups to bound it."
+        ),
+    )
+    parser.add_argument(
+        "--max-lookups",
+        type=int,
+        default=None,
+        help=(
+            "catalog only: cap --with-pdf-links searches, spent on the "
+            "most-cited works first."
+        ),
+    )
     args = parser.parse_args()
+
+    # Catalog mode paginates for ceil(N/100) searches regardless of N, so the
+    # default is "everything"; the download path costs a search per article and
+    # keeps its conservative default.
+    num_articles = args.num_articles
+    if num_articles is None:
+        num_articles = 1000 if args.mode == "catalog" else 25
 
     if args.mode == "ingest_local":
         papers = ingest_local_pdfs(reextract_authors=args.reextract_authors)
         print(f"Ingested {len(papers)} papers from local PDFs.")
+    elif args.mode == "catalog":
+        papers = fetch_author_catalog(
+            author_id=args.author_id,
+            num_articles=num_articles,
+            with_pdf_links=args.with_pdf_links,
+            max_lookups=args.max_lookups,
+        )
+        have = sum(1 for p in papers if p.has_pdf)
+        links = sum(1 for p in papers if p.pdf_url)
+        print(
+            f"Cataloged {len(papers)} works for author ID {args.author_id} "
+            f"({have} with a PDF, {links} with a public PDF link). "
+            f"Checklist: {CATALOG_PATH}"
+        )
     else:
         papers = fetch_author_papers(
             author_id=args.author_id,
-            num_articles=args.num_articles,
+            num_articles=num_articles,
             interactive=args.interactive,
         )
         print(f"Fetched {len(papers)} papers for author ID {args.author_id}.")

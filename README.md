@@ -110,6 +110,7 @@ Run from the root of the repository in order:
    Optional flags:
    - `--author-id <ID>` — fetch papers for a different Google Scholar Author ID (default: `j8iA0kAAAAAJ`)
    - `--num-articles <N>` — number of articles to fetch (default: `25`)
+   - `--interactive` - Waits for you to go and download pdfs manually if the program was restricted from automatically doing so.
 
    Example: `uv run -m chat_cembrowski.data.ingestion --author-id XYZ123 --num-articles 50`
 

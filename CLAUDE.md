@@ -12,14 +12,19 @@ uv sync
 uv run -m chat_cembrowski.data.ingestion            # 1a. Fetch papers via SerpAPI Google Scholar
 uv run -m chat_cembrowski.data.ingestion ingest_local  # 1b. Create Paper objects from locally-sourced PDFs
 
-# Fetch the author's entire publication list. Results are paginated, so a
-# --num-articles larger than the author's output just fetches everything.
-# Budget ~1 SerpAPI credit and ~2s per article.
-uv run -m chat_cembrowski.data.ingestion --num-articles 1000
+# Catalog the author's entire publication list WITHOUT downloading anything.
+# Costs ceil(N/100) SerpAPI searches total (4 for 332 works) and writes a
+# sourcing checklist to data/catalog.csv. This is the recommended entry point
+# — see "Acquisition reality" below for why downloading rarely works.
+uv run -m chat_cembrowski.data.ingestion catalog
 
-# Then backfill authoritative metadata from the PDFs themselves. SerpAPI
-# truncates long author lists; --reextract-authors re-derives every paper's
-# authors from its PDF rather than only the visibly truncated ones.
+# Optionally resolve public PDF URLs too. ONE SerpAPI search per article, so
+# bound it; the budget is spent on the most-cited works first.
+uv run -m chat_cembrowski.data.ingestion catalog --with-pdf-links --max-lookups 50
+
+# Attach hand-collected PDFs to their catalog rows (matched by title) and
+# backfill authoritative metadata from the PDFs themselves. SerpAPI truncates
+# long author lists; --reextract-authors re-derives every paper's authors.
 uv run -m chat_cembrowski.data.ingestion ingest_local --reextract-authors
 uv run -m chat_cembrowski.data.parser               # 2. Parse PDFs → markdown, store in data/json/
 uv run -m chat_cembrowski.data.image_extractor      # 3. Extract images → data/images/ + data/image_json/
@@ -102,10 +107,22 @@ extras/       # Miscellaneous files not part of the pipeline (gitignored)
 
 1. **ingestion.py** — Two entry points: `fetch_author_papers()` calls SerpAPI's Google Scholar Author API, downloads PDFs, and saves Paper JSON objects (authors truncated by SerpAPI are stored with `"..."` as a sentinel). `ingest_local_pdfs()` scans `data/papers/` for PDFs without a JSON entry and creates Paper objects by extracting first-page text via PyMuPDF and calling GPT-4.1-mini for structured metadata; it also patches any existing Paper with a missing/truncated author list or missing `first_page_number` using the same first-page extraction.
 
-   Three things about `fetch_author_papers` are load-bearing for a full-corpus run:
+   **Acquisition reality — measured, not assumed.** Of a 5-article sample, 3 had a "public" PDF per Scholar and **all 3 returned 403**; the other 2 had no public resource at all. This is not fixable in code: a browser User-Agent changes nothing, OpenAlex resolves to the same bot-blocked publisher URLs, and the two works with PMC IDs sit outside the OA subset (Europe PMC 404s both). Expect this to be **worse** from AWS, since datacenter IP ranges are blocked hardest. Hand-collection into `data/papers/` is the realistic acquisition path, so the pipeline is built around discovery and acquisition being separate steps.
+
+   `fetch_author_catalog()` is the discovery half and the recommended entry point. It paginates the author's full list for `ceil(N/100)` searches, writes a Paper per work with **no `source_file`**, and emits `data/catalog.csv` (most-cited first) as the sourcing checklist. It **merges rather than overwrites** — re-running refreshes metadata but never drops an already-acquired `source_file`, `text`, `processed` or `first_page_number`. It also de-duplicates by title, because Scholar keeps separate records for the same work (conference abstract vs journal version) which would otherwise become duplicate chunks in Qdrant. `--with-pdf-links` adds the paid per-article lookup, bounded by `--max-lookups`.
+
+   `ingest_local_pdfs()` is the acquisition half: a hand-downloaded PDF is fuzzy-matched by title (`TITLE_MATCH_THRESHOLD`, rapidfuzz `token_set_ratio`) against catalog rows awaiting a PDF and **attached to the existing row** rather than creating a second record for the same work. The threshold is deliberately high — an unmatched PDF just becomes a standalone Paper, but a mismatched one files a PDF under another work's citation.
+
+   Three things about the older `fetch_author_papers` (download path) are load-bearing for a full-corpus run:
    - **Pagination.** The Author API caps a single call at 100 results and defaults to 20. `_get_author_articles` therefore loops on `start` until `serpapi_pagination.next` is absent; without that loop `num_articles` silently topped out at 20 no matter how large it was set.
    - **PDF only.** `_find_public_resource` accepts `file_format == "pdf"` and skips HTML. Everything downstream opens `source_file` with PyMuPDF, so an `.html` Paper would be registered and then crash `vectordb`'s `has_text_layer` call. HTML-only articles are logged for manual collection.
    - **Failed downloads create no Paper.** A JSON pointing at a file that was never written is worse than an omission, for the same reason. Failures are collected and reported at the end of the run; `--interactive` restores the old pause-and-place-by-hand behaviour, which is off by default because publisher links 403 often enough to stall a long run on stdin.
+
+   **`Paper.source_file` is optional (`""` means "no PDF yet").** A catalog row exists before its blob does — which is also the shape needed once blobs move to S3. Anything reading `source_file` must handle the empty case: `parser` and `image_extractor` already skip it, and `vectordb` guards on `paper.has_pdf` because `PAPERS_DIR / ""` resolves to the directory itself.
+
+   **Paper IDs must be filesystem-safe.** Scholar `citation_id`s look like `j8iA0kAAAAAJ:2osOgNQ5qMEC`, and IDs become `<id>.json` / `<id>.pdf` paths — the colon is illegal on Windows. `_safe_id()` sanitizes both `citation_id` and the search `result_id`.
+
+   **PDF discovery is case-insensitive on every platform** (`_iter_pdfs`). `glob("*.pdf")` is case-insensitive on Windows because the filesystem is, but case-sensitive on Linux, so a browser-saved `Paper.PDF` would ingest locally and be silently ignored in a container.
 2. **parser.py** — Parses each PDF via `pymupdf4llm.to_markdown()` and writes the extracted markdown into the corresponding JSON file in `data/json/`. Also provides `parse_pdf_for_pages()` for per-page extraction used by the chunker.
 3. **image_extractor.py** — Extracts images from each parsed PDF page via PyMuPDF, finds captions in the surrounding text, and writes `ImageRecord` JSON files to `data/image_json/`.
 4. **doc_ingestion.py** — Scans `data/docs/` for supported file types and creates `Document` objects with structured extracted text. `.docx` files are converted to markdown (headings → `#`, lists → `-`, tables → markdown tables). Code files are read as-is. Saves JSON to `data/doc_json/`. Idempotent.
