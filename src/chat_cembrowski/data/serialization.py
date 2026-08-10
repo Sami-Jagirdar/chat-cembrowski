@@ -128,12 +128,13 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> Iterator[Pap
 
             paper = Paper(
                 source_file=data["source_file"],
-                text=data["text"],
+                text=data.get("text", ""),
                 id=data["id"],
                 title=data.get("title"),
                 authors=data.get("authors"),
                 year=data.get("year"),
                 publication=data.get("publication"),
+                first_page_number=data.get("first_page_number"),
                 processed=data.get("processed", False),
             )
             logger.info(f"Loaded: {json_file.name}")

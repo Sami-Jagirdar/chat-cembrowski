@@ -29,6 +29,8 @@ DEFAULT_AUTHOR_ID = "j8iA0kAAAAAJ"  # George Cembrowski's Google Scholar Author 
 DATA_DIR = Path(__file__).resolve().parents[3] / "data/papers"
 SERPAPI_BASE_URL = "https://serpapi.com/search"
 REQUEST_DELAY = 1  # Delay between requests in seconds
+SERPAPI_AUTHOR_PAGE_SIZE = 100  # Max articles per Google Scholar Author API call
+AUTHOR_TRUNCATION_MARKERS = {"...", "…"}  # SerpAPI's "and more authors" sentinels
 
 def _get_author_articles(
         api_key: str,
@@ -36,23 +38,52 @@ def _get_author_articles(
         num_articles: int = 10,
 ) -> list[dict]:
     """
-    Calls Google Scholar Author API to get the author's top articles.
+    Calls Google Scholar Author API to get the author's articles, paginating
+    until num_articles are collected or the author's list is exhausted.
+
+    The API returns SERPAPI_AUTHOR_PAGE_SIZE articles per call at most and
+    defaults to 20, so a single un-paginated call silently caps the corpus at
+    20 papers no matter how large num_articles is. Requesting more than the
+    author has published is safe: the loop stops when a page comes back empty
+    or SerpAPI reports no next page.
 
     Args:
         api_key: SerpAPI API key
         author_id: Google Scholar Author ID
-        num_articles: Number of articles to retrieve
+        num_articles: Maximum number of articles to retrieve
 
     Returns:
             List of dictionaries representing the author's articles.
     """
 
     client = serpapi.Client(api_key=api_key)
-    results = client.search({
-        "engine": "google_scholar_author",
-        "author_id": author_id,
-    })
-    articles = results.get("articles", [])
+    articles: list[dict] = []
+    start = 0
+
+    while len(articles) < num_articles:
+        page_size = min(SERPAPI_AUTHOR_PAGE_SIZE, num_articles - len(articles))
+        results = client.search({
+            "engine": "google_scholar_author",
+            "author_id": author_id,
+            "num": page_size,
+            "start": start,
+        })
+        page = results.get("articles", [])
+        if not page:
+            break
+
+        articles.extend(page)
+        logger.info(
+            f"Retrieved {len(page)} articles at offset {start} "
+            f"({len(articles)} total) for author {author_id}"
+        )
+
+        if not results.get("serpapi_pagination", {}).get("next"):
+            break
+
+        start += len(page)
+        time.sleep(REQUEST_DELAY)
+
     logger.info(f"Retrieved {len(articles)} articles for author {author_id}")
     return articles[:num_articles]
 
@@ -61,7 +92,14 @@ def _find_public_resource(
         api_key: str,
 ) -> tuple[Optional[str], Optional[str]]:
     """
-    Searches for a specific paper using Google Scholar API and looks for a publicly available PDF or HTML link.
+    Searches for a specific paper using Google Scholar API and looks for a publicly available PDF link.
+
+    PDF only: every downstream stage (parser, image_extractor, vectordb) opens
+    the source file with PyMuPDF, so an HTML resource saved here would be
+    registered as a Paper and then crash or be skipped further down the
+    pipeline. Articles whose only public resource is HTML are reported and
+    left for manual collection into data/papers/.
+
     Args:
         article_title: Title of the article to search for
         api_key: SerpAPI API key
@@ -84,16 +122,26 @@ def _find_public_resource(
     article = organic_results[0]
     resources: list[dict] = article.get("resources", [])
     result_id = article.get("result_id", "")
+    saw_html = False
     for resource in resources:
         file_format: str = resource.get("file_format", "").lower()
         link: str = resource.get("link", "")
+        if not link:
+            continue
 
-
-        if file_format in ["pdf", "html"] and link:
-            logger.info(f"Found public resource for article '{article_title}': {link} ({file_format})")
+        if file_format == "pdf":
+            logger.info(f"Found public PDF for article '{article_title}': {link}")
             return link, result_id
+        if file_format == "html":
+            saw_html = True
 
-    logger.debug(f"No public resources found for article: {article_title}")
+    if saw_html:
+        logger.info(
+            f"Only an HTML resource is available for '{article_title}' — skipping. "
+            "Save a PDF into data/papers/ and run 'ingest_local' to include it."
+        )
+    else:
+        logger.debug(f"No public resources found for article: {article_title}")
     return (None, None)
 
 def _download_file(url: str, dest_path: Path) -> bool:
@@ -128,14 +176,23 @@ def fetch_author_papers(
     api_key: str = SERPAPI_KEY,
     data_dir: Path = DATA_DIR,
     num_articles: int = 25,
+    interactive: bool = False,
 ) -> list[Paper]:
     """
     Main function to fetch papers for a given author.
+
+    Each article costs one extra SerpAPI search (the public-resource lookup),
+    so a run over N articles spends roughly N+1 credits and takes at least
+    2*N seconds from REQUEST_DELAY alone.
+
     Args:
         author_id: Google Scholar Author ID
         api_key: SerpAPI API key
-        num_articles: Number of articles to fetch
+        num_articles: Maximum number of articles to fetch
         data_dir: Directory to save downloaded papers
+        interactive: Pause on each failed download so the PDF can be placed by
+            hand. Off by default — publisher links 403 often enough that a
+            large run would otherwise stall indefinitely on stdin.
 
     Returns:
         List of Paper objects.
@@ -149,6 +206,7 @@ def fetch_author_papers(
 
     articles = _get_author_articles(api_key, author_id, num_articles)
     papers: list[Paper] = []
+    failed_downloads: list[tuple[str, str]] = []
 
     for article in articles:
 
@@ -165,16 +223,24 @@ def fetch_author_papers(
             continue
 
         # Download the paper
-        ext = "html" if resource_url.lower().endswith(".html") else "pdf"
         filename_id = result_id or title
-        filename = f"{filename_id}.{ext}"
+        filename = f"{filename_id}.pdf"
         dest_path = data_dir / filename
 
         success = _download_file(resource_url, dest_path)
         if not success:
-            logger.error(f"Failed to download paper '{title}'.")
-            logger.info(f"Please manually download the article at url: {resource_url}. Rename it to {filename} and save it in {data_dir} to include it in the dataset.")
-            input("Press Enter to continue")
+            # No Paper is created: a JSON pointing at a file that was never
+            # written breaks vectordb, which opens source_file unconditionally.
+            logger.error(f"Failed to download paper '{title}' — not registering it.")
+            logger.info(
+                f"To include it, download {resource_url} manually into {data_dir} "
+                "and run 'ingest_local'."
+            )
+            failed_downloads.append((title, resource_url))
+            if interactive:
+                input("Press Enter to continue")
+            time.sleep(REQUEST_DELAY)
+            continue
 
         paper_id = result_id.strip() if result_id and result_id.strip() else str(uuid.uuid7())
 
@@ -209,6 +275,13 @@ def fetch_author_papers(
         time.sleep(REQUEST_DELAY)
 
     logger.info(f"Finished fetching papers. Total papers fetched: {len(papers)}")
+    if failed_downloads:
+        logger.warning(
+            f"{len(failed_downloads)} article(s) had a public PDF that could not be "
+            f"downloaded. Collect these by hand into {data_dir}, then run 'ingest_local':"
+        )
+        for title, url in failed_downloads:
+            logger.warning(f"  - {title}: {url}")
     save_papers_to_json(papers)
     return papers
 
@@ -289,17 +362,36 @@ def _extract_metadata_with_llm(first_page_text: str, client: OpenAI) -> dict:
         return {}
 
 
+def _authors_incomplete(authors: Optional[list[str]]) -> bool:
+    """
+    True when an author list is missing or visibly truncated.
+
+    SerpAPI reports "and more authors" with a trailing ellipsis, which arrives
+    as its own list element after the comma split. It emits both the three-dot
+    and the single-character form, hence the marker set.
+    """
+    if not authors:
+        return True
+    return any(a.strip() in AUTHOR_TRUNCATION_MARKERS for a in authors)
+
+
 def ingest_local_pdfs(
     papers_dir: Path = DATA_DIR,
     json_dir: Optional[Path] = None,
+    reextract_authors: bool = False,
 ) -> list[Paper]:
     """
     Creates Paper objects for PDFs in papers_dir that don't have a JSON entry,
-    and patches incomplete author lists (containing "...") using first-page LLM extraction.
+    and patches missing/truncated author lists and missing first_page_number
+    using first-page LLM extraction.
 
     Args:
         papers_dir: Directory containing PDF files (default: data/papers)
         json_dir: Directory containing JSON metadata files (default: data/json)
+        reextract_authors: Re-derive authors from the PDF for every registered
+            paper, not just visibly truncated ones. SerpAPI sometimes returns a
+            short author list with no ellipsis to mark it, which no sentinel can
+            detect; the PDF is authoritative. Costs one LLM call per paper.
 
     Returns:
         List of newly created Paper objects.
@@ -353,8 +445,9 @@ def ingest_local_pdfs(
         logger.info(f"Created Paper: {paper.title}")
 
     # Patch existing papers missing first_page_number or with truncated authors
+    patched_count = 0
     for paper in existing_papers:
-        needs_authors = paper.authors is not None and "..." in paper.authors
+        needs_authors = reextract_authors or _authors_incomplete(paper.authors)
         needs_first_page = paper.first_page_number is None
 
         if not (needs_authors or needs_first_page):
@@ -385,8 +478,12 @@ def ingest_local_pdfs(
 
         if patched:
             save_paper(paper, json_dir)
+            patched_count += 1
 
-    logger.info(f"Ingestion complete. New papers created: {len(new_papers)}.")
+    logger.info(
+        f"Ingestion complete. New papers created: {len(new_papers)}. "
+        f"Existing papers patched: {patched_count}."
+    )
     return new_papers
 
 
@@ -414,15 +511,36 @@ if __name__ == "__main__":
         "--num-articles",
         type=int,
         default=25,
-        help="Number of articles to fetch (default: 25).",
+        help=(
+            "Maximum number of articles to fetch (default: 25). Results are "
+            "paginated, so a value larger than the author's publication count "
+            "simply fetches everything. Costs ~1 SerpAPI credit per article."
+        ),
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Pause on each failed download to allow placing the PDF by hand.",
+    )
+    parser.add_argument(
+        "--reextract-authors",
+        action="store_true",
+        help=(
+            "ingest_local only: re-derive authors from the PDF for every "
+            "registered paper, not just visibly truncated ones."
+        ),
     )
     args = parser.parse_args()
 
     if args.mode == "ingest_local":
-        papers = ingest_local_pdfs()
+        papers = ingest_local_pdfs(reextract_authors=args.reextract_authors)
         print(f"Ingested {len(papers)} papers from local PDFs.")
     else:
-        papers = fetch_author_papers(author_id=args.author_id, num_articles=args.num_articles)
+        papers = fetch_author_papers(
+            author_id=args.author_id,
+            num_articles=args.num_articles,
+            interactive=args.interactive,
+        )
         print(f"Fetched {len(papers)} papers for author ID {args.author_id}.")
 
     for paper in papers:

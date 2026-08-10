@@ -11,6 +11,16 @@ uv sync
 # Run data pipeline stages (order matters)
 uv run -m chat_cembrowski.data.ingestion            # 1a. Fetch papers via SerpAPI Google Scholar
 uv run -m chat_cembrowski.data.ingestion ingest_local  # 1b. Create Paper objects from locally-sourced PDFs
+
+# Fetch the author's entire publication list. Results are paginated, so a
+# --num-articles larger than the author's output just fetches everything.
+# Budget ~1 SerpAPI credit and ~2s per article.
+uv run -m chat_cembrowski.data.ingestion --num-articles 1000
+
+# Then backfill authoritative metadata from the PDFs themselves. SerpAPI
+# truncates long author lists; --reextract-authors re-derives every paper's
+# authors from its PDF rather than only the visibly truncated ones.
+uv run -m chat_cembrowski.data.ingestion ingest_local --reextract-authors
 uv run -m chat_cembrowski.data.parser               # 2. Parse PDFs → markdown, store in data/json/
 uv run -m chat_cembrowski.data.image_extractor      # 3. Extract images → data/images/ + data/image_json/
 uv run -m chat_cembrowski.data.doc_ingestion        # 4. Ingest docs from data/docs/ → data/doc_json/
@@ -90,7 +100,12 @@ extras/       # Miscellaneous files not part of the pipeline (gitignored)
 
 ### Data flow
 
-1. **ingestion.py** — Two entry points: `fetch_author_papers()` calls SerpAPI's Google Scholar Author API, downloads PDFs, and saves Paper JSON objects (authors truncated by SerpAPI are stored with `"..."` as a sentinel). `ingest_local_pdfs()` scans `data/papers/` for PDFs without a JSON entry and creates Paper objects by extracting first-page text via PyMuPDF and calling GPT-4.1-mini for structured metadata; it also patches any existing Paper whose authors list contains `"..."` using the same first-page extraction.
+1. **ingestion.py** — Two entry points: `fetch_author_papers()` calls SerpAPI's Google Scholar Author API, downloads PDFs, and saves Paper JSON objects (authors truncated by SerpAPI are stored with `"..."` as a sentinel). `ingest_local_pdfs()` scans `data/papers/` for PDFs without a JSON entry and creates Paper objects by extracting first-page text via PyMuPDF and calling GPT-4.1-mini for structured metadata; it also patches any existing Paper with a missing/truncated author list or missing `first_page_number` using the same first-page extraction.
+
+   Three things about `fetch_author_papers` are load-bearing for a full-corpus run:
+   - **Pagination.** The Author API caps a single call at 100 results and defaults to 20. `_get_author_articles` therefore loops on `start` until `serpapi_pagination.next` is absent; without that loop `num_articles` silently topped out at 20 no matter how large it was set.
+   - **PDF only.** `_find_public_resource` accepts `file_format == "pdf"` and skips HTML. Everything downstream opens `source_file` with PyMuPDF, so an `.html` Paper would be registered and then crash `vectordb`'s `has_text_layer` call. HTML-only articles are logged for manual collection.
+   - **Failed downloads create no Paper.** A JSON pointing at a file that was never written is worse than an omission, for the same reason. Failures are collected and reported at the end of the run; `--interactive` restores the old pause-and-place-by-hand behaviour, which is off by default because publisher links 403 often enough to stall a long run on stdin.
 2. **parser.py** — Parses each PDF via `pymupdf4llm.to_markdown()` and writes the extracted markdown into the corresponding JSON file in `data/json/`. Also provides `parse_pdf_for_pages()` for per-page extraction used by the chunker.
 3. **image_extractor.py** — Extracts images from each parsed PDF page via PyMuPDF, finds captions in the surrounding text, and writes `ImageRecord` JSON files to `data/image_json/`.
 4. **doc_ingestion.py** — Scans `data/docs/` for supported file types and creates `Document` objects with structured extracted text. `.docx` files are converted to markdown (headings → `#`, lists → `-`, tables → markdown tables). Code files are read as-is. Saves JSON to `data/doc_json/`. Idempotent.
@@ -265,3 +280,5 @@ Results are rendered into a context block (`_build_nih_context`, same `SOURCE {i
 ### Page number note
 
 Page numbers in chunk payloads are journal/article page numbers (offset from `first_page_number` extracted during ingestion). If `first_page_number` is unavailable, PDF page numbers are used as a fallback.
+
+**`serialization.load_papers_from_json` must carry `first_page_number`.** It is the loader used by `vectordb`, `image_extractor`, and `ingestion`'s patch loop, and it previously dropped the field (unlike the singular `load_paper`). The effect was silent and total: `chunker` and `image_extractor` always saw `None`, so every payload page number fell back to a raw PDF page, and `ingestion`'s `needs_first_page` check was permanently `True` — re-running `ingest_local` re-ran the LLM on the whole corpus and could overwrite a stored value with `null`. Adding a field to `Paper` means adding it in both loaders.
