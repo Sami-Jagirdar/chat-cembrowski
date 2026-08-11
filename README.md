@@ -33,6 +33,7 @@ Optional overrides, all with working defaults — see `.env.example`: `LLM_PROVI
 
 ```
 data/
+  catalog.csv # Sourcing checklist: every known work, most-cited first
   papers/     # PDF source files
   json/       # Paper metadata + extracted text as JSON
   docs/       # Miscellaneous context documents (txt, md, docx, code files)
@@ -102,36 +103,83 @@ At realistic site volume this is a difference of a few dollars a month. The deci
 
 ### Research Papers
 
+Ingestion is split into **discovery** (what has the author published?) and **acquisition** (get the PDF). Discovery is cheap and automatic; acquisition is mostly manual, for reasons covered in [Why acquisition is manual](#why-acquisition-is-manual).
+
 Run from the root of the repository in order:
 
-1. `uv run -m chat_cembrowski.data.ingestion`
-   Fetches paper metadata via SerpAPI Google Scholar for the default author (George Cembrowski). You may need to manually download some PDFs and place them in `data/papers/` as instructed by the script.
+1. `uv run -m chat_cembrowski.data.ingestion catalog`
+   Records every work the author has published, **without downloading anything**. Writes one Paper JSON per work (with no `source_file` yet) and a sourcing checklist to `data/catalog.csv`, sorted most-cited first.
+
+   Costs `ceil(N/100)` SerpAPI searches in total — **4 searches for a 332-work profile**, regardless of `--num-articles`. This is the recommended entry point.
 
    Optional flags:
-   - `--author-id <ID>` — fetch papers for a different Google Scholar Author ID (default: `j8iA0kAAAAAJ`)
-   - `--num-articles <N>` — number of articles to fetch (default: `25`)
+   - `--author-id <ID>` — a different Google Scholar Author ID (default: `j8iA0kAAAAAJ`)
+   - `--num-articles <N>` — upper bound on works (default: `1000`, i.e. everything). Overshooting is safe; pagination stops when the author's list is exhausted.
+   - `--with-pdf-links` — also resolve a public PDF URL per work. **Costs one SerpAPI search per article**, so bound it with `--max-lookups`.
+   - `--max-lookups <N>` — cap those paid lookups, spent on the most-cited works first.
 
-   Example: `uv run -m chat_cembrowski.data.ingestion --author-id XYZ123 --num-articles 50`
+   Re-running is safe: the catalog merges rather than overwrites, so refreshing metadata never drops an already-acquired PDF, its extracted text, or its `processed` flag. It also de-duplicates by title, since Scholar keeps separate records for the same work (conference abstract vs. journal version) that would otherwise become duplicate chunks in Qdrant.
 
-2. `uv run -m chat_cembrowski.data.ingestion ingest_local`
-   Creates Paper objects for any PDFs in `data/papers/` not yet registered, extracting metadata from the first page via GPT-4.1-mini.
+   `data/catalog.csv` columns:
 
-3. `uv run -m chat_cembrowski.data.parser`
+   | Column | Notes |
+   |---|---|
+   | `id`, `title`, `authors`, `year`, `publication` | From Scholar; author lists may be truncated (see step 3) |
+   | `cited_by` | Sort key — decides what is worth sourcing first |
+   | `have_pdf` | `yes` once a PDF is attached |
+   | `pdf_url` | Only populated by `--with-pdf-links` |
+   | `scholar_link` | Always present, free — the click-through to the publisher |
+
+2. **Collect PDFs into `data/papers/`.** Work down `catalog.csv` from the top and download in a browser. Filenames don't matter — they get renamed on ingest. For a corpus of this size, asking the author or an institutional-access holder for the PDFs in bulk will out-yield anything else.
+
+3. `uv run -m chat_cembrowski.data.ingestion ingest_local`
+   Attaches those PDFs to their catalog rows. Each PDF's title is extracted from its first page via GPT-4.1-mini and fuzzy-matched against catalog entries still awaiting a PDF; on a confident match the existing row is updated rather than a second record being created for the same work. A PDF that matches nothing becomes a standalone Paper.
+
+   This step is also where **authoritative metadata** comes from: SerpAPI truncates long author lists (storing `...` as a sentinel), and the PDF is the better source.
+
+   Optional flag:
+   - `--reextract-authors` — re-derive authors from the PDF for *every* registered paper, not just visibly truncated ones. Scholar sometimes returns a short author list with nothing to mark it as incomplete, which no sentinel can detect. Costs one LLM call per paper.
+
+4. `uv run -m chat_cembrowski.data.parser`
    Parses each PDF to markdown and stores it in the Paper JSON.
 
-4. `uv run -m chat_cembrowski.data.image_extractor`
+5. `uv run -m chat_cembrowski.data.image_extractor`
    Extracts images from each PDF, finds captions, and writes ImageRecord JSONs to `data/image_json/`.
 
-5. `uv run -m chat_cembrowski.data.vectordb`
+6. `uv run -m chat_cembrowski.data.vectordb`
    Chunks, embeds, and upserts everything to Qdrant.
 
    Optional flag:
    - `--collection <name>` — Qdrant collection name to upsert into (default: `BAPa-V1`)
 
+Steps 4–6 skip catalog entries that have no PDF yet, so the pipeline runs cleanly against a partially-sourced corpus — it simply embeds nothing for works you haven't collected. Re-run them as more PDFs arrive.
+
 To re-index papers from scratch, reset the processed flag first:
 ```
 uv run scripts/reset_paper_processed.py
 ```
+
+#### Why acquisition is manual
+
+The obvious design — have SerpAPI find each paper's "publicly available" PDF and download it — does not work on this corpus. Measured on a 5-article sample: 3 had a public PDF according to Scholar and **all 3 returned HTTP 403**; the other 2 had no public resource at all. **0 of 5 acquired.**
+
+That isn't a bug to fix in code:
+
+- A browser `User-Agent` changes nothing — ResearchGate and SAGE are running real bot protection, not header sniffing.
+- OpenAlex independently resolves two of those works to the *same* blocked publisher URLs.
+- The two works with PMC IDs sit outside the PMC open-access subset; Europe PMC returns 404 for both PDF and full-text XML.
+
+Scholar lists these as public because Scholar's own crawler can reach them. A script cannot. Expect this to be **worse** from cloud infrastructure, where datacenter IP ranges are blocked most aggressively.
+
+The cost asymmetry drives the rest of the design. Paginating the full publication list is 4 SerpAPI searches; resolving a public PDF link is one search *per article* — ~332 for this author, against a free-tier quota of 250/month. Spending virtually the entire quota on the step with a near-zero success rate is the wrong trade, so discovery and acquisition are separate commands and only discovery runs by default.
+
+The legacy download path is still available for authors whose work *is* freely reachable:
+
+```
+uv run -m chat_cembrowski.data.ingestion --num-articles 50
+```
+
+It costs ~1 SerpAPI search per article, accepts PDFs only (every downstream stage opens `source_file` with PyMuPDF), creates no Paper record for a failed download, and prints the failures as a to-collect list at the end. `--interactive` restores the older behaviour of pausing on each failure so you can place the PDF by hand — off by default, since a large run would otherwise stall on stdin hundreds of times.
 
 ### Miscellaneous Documents
 

@@ -4,16 +4,32 @@ from typing import Optional
 
 @dataclass
 class Paper:
-    """Represents a research paper."""
+    """
+    Represents a research paper.
+
+    source_file is optional: a catalog-only Paper records a work that is known
+    to exist but whose PDF has not been acquired yet. Publisher bot protection
+    makes that the common case, so the record has to be able to exist before
+    the blob does — which is also the shape needed once blobs move to S3.
+    Anything that reads source_file must treat "" as "no PDF yet".
+    """
     id: str
-    source_file: str
+    source_file: str = ""
     title: Optional[str] = None
     authors: Optional[list[str]] = None
     year: Optional[int] = None
     publication: Optional[str] = None
     first_page_number: Optional[int] = None
+    scholar_link: Optional[str] = None   # Google Scholar citation page
+    pdf_url: Optional[str] = None        # public PDF, when a lookup found one
+    cited_by: Optional[int] = None       # citation count, for sourcing priority
     processed: bool = False
     text: str = ""
+
+    @property
+    def has_pdf(self) -> bool:
+        """True when a source file has been acquired for this paper."""
+        return bool(self.source_file)
 
     def to_dict(self) -> dict:
         return {
@@ -24,6 +40,9 @@ class Paper:
             "year": self.year,
             "publication": self.publication,
             "first_page_number": self.first_page_number,
+            "scholar_link": self.scholar_link,
+            "pdf_url": self.pdf_url,
+            "cited_by": self.cited_by,
             "processed": self.processed,
             "text": self.text,
         }

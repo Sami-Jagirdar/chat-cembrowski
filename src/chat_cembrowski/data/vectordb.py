@@ -379,6 +379,16 @@ if __name__ == "__main__":
                 )
                 continue
 
+            # Catalog-only entry: the work is known but its PDF has not been
+            # acquired. There is nothing to chunk, and PAPERS_DIR / "" would
+            # resolve to the directory itself.
+            if not paper.has_pdf:
+                logger.info(
+                    f"Paper '{paper.title}' (ID: {paper.id}) has no PDF yet "
+                    "— skipping. Collect it into data/papers/ and run ingest_local.\n"
+                )
+                continue
+
             method = args.method
             if method == "auto":
                 method = (

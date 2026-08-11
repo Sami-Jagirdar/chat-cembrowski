@@ -83,13 +83,16 @@ def load_paper(json_file: str | Path) -> Optional[Paper]:
             data = json.load(f)
 
         paper = Paper(
-            source_file=data["source_file"],
+            source_file=data.get("source_file", ""),
             id=data["id"],
             title=data.get("title"),
             authors=data.get("authors"),
             year=data.get("year"),
             publication=data.get("publication"),
             first_page_number=data.get("first_page_number"),
+            scholar_link=data.get("scholar_link"),
+            pdf_url=data.get("pdf_url"),
+            cited_by=data.get("cited_by"),
             processed=data.get("processed", False),
             text=data.get("text", ""),
         )
@@ -127,13 +130,17 @@ def load_papers_from_json(json_dir: Optional[str | Path] = None) -> Iterator[Pap
                 data = json.load(f)
 
             paper = Paper(
-                source_file=data["source_file"],
-                text=data["text"],
+                source_file=data.get("source_file", ""),
+                text=data.get("text", ""),
                 id=data["id"],
                 title=data.get("title"),
                 authors=data.get("authors"),
                 year=data.get("year"),
                 publication=data.get("publication"),
+                first_page_number=data.get("first_page_number"),
+                scholar_link=data.get("scholar_link"),
+                pdf_url=data.get("pdf_url"),
+                cited_by=data.get("cited_by"),
                 processed=data.get("processed", False),
             )
             logger.info(f"Loaded: {json_file.name}")
