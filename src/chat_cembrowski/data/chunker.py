@@ -27,10 +27,17 @@ JSON_DIR = PROJECT_ROOT / "data/json"
 IMAGE_JSON_DIR = PROJECT_ROOT / "data/image_json"
 PAGE_IMAGES_DIR = PROJECT_ROOT / "data/page_images"
 
-# Fixed namespace for deriving deterministic page-chunk IDs (uuid5), so
-# re-running chunk_paper_pages() on the same paper yields the same point IDs
-# and upserts overwrite in place rather than duplicating.
+# Fixed namespaces for deriving deterministic chunk IDs (uuid5), so re-running
+# the chunker on the same source yields the same point IDs and upserts
+# overwrite in place rather than duplicating.
+#
+# Deterministic IDs handle an updated chunk but not a *removed* one: if an edit
+# shortens a source from 10 chunks to 7, points 7-9 keep their old content. The
+# other half of the contract is vectordb.delete_points_for(), which clears a
+# source's points before re-upserting. Both are required.
 PAGE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.page_chunks")
+TEXT_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.text_chunks")
+DOC_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.doc_chunks")
 
 def _build_payload(paper: Paper, chunk_index: int, chunk_text: str, page_start: int, page_end: int) -> dict:
     """
@@ -165,7 +172,7 @@ def chunk_paper(paper: Paper) -> list[Chunk]:
 
         chunks.append(
             Chunk(
-                id=str(uuid.uuid4()),
+                id=str(uuid.uuid5(TEXT_ID_NAMESPACE, f"{paper.id}:text:{i}")),
                 text=_build_text_embed_text(paper, chunk_text),
                 payload=_build_payload(
                     paper, i, chunk_text,
@@ -216,7 +223,7 @@ def chunk_paper_text_only(paper: Paper) -> list[Chunk]:
 
         chunks.append(
             Chunk(
-                id=str(uuid.uuid4()),
+                id=str(uuid.uuid5(TEXT_ID_NAMESPACE, f"{paper.id}:text:{i}")),
                 text=_build_text_embed_text(paper, chunk_text),
                 payload=_build_payload(paper, i, chunk_text, 1, 1),
             )
@@ -553,7 +560,7 @@ def chunk_document(doc: Document) -> list[Chunk]:
             continue
         chunks.append(
             Chunk(
-                id=str(uuid.uuid4()),
+                id=str(uuid.uuid5(DOC_ID_NAMESPACE, f"{doc.id}:text:{i}")),
                 text=_build_doc_embed_text(doc, chunk_text),
                 payload=_build_doc_payload(doc, i, chunk_text),
             )

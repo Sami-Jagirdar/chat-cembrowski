@@ -63,12 +63,21 @@ class Chunk:
 
 @dataclass
 class Document:
-    """Represents a miscellaneous context document (txt, docx, code file)."""
+    """
+    Represents a miscellaneous context document (txt, docx, code file).
+
+    Unlike papers, documents are expected to be edited in place. content_hash
+    is what makes that detectable: doc_ingestion re-extracts when the hash of
+    the file's text no longer matches, and clears processed so vectordb
+    re-indexes it. Without it, an edited file is indistinguishable from an
+    unchanged one and is skipped forever.
+    """
     id: str
     title: str
     source_file: str    # filename in data/docs/
     file_type: str      # "txt", "docx", "py", etc.
     text: str = ""
+    content_hash: Optional[str] = None  # sha256 of text; detects edits
     processed: bool = False
 
     def to_dict(self) -> dict:
@@ -78,6 +87,7 @@ class Document:
             "source_file": self.source_file,
             "file_type": self.file_type,
             "text": self.text,
+            "content_hash": self.content_hash,
             "processed": self.processed,
         }
 

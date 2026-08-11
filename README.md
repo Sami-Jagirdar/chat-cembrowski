@@ -154,9 +154,12 @@ Run from the root of the repository in order:
 
 Steps 4–6 skip catalog entries that have no PDF yet, so the pipeline runs cleanly against a partially-sourced corpus — it simply embeds nothing for works you haven't collected. Re-run them as more PDFs arrive.
 
-To re-index papers from scratch, reset the processed flag first:
+**Editing content already in the index.** Documents in `data/docs/` are expected to change. Edit the file and re-run `doc_ingestion` then `vectordb` — the edit is detected by content hash, and re-indexing *replaces* the old chunks rather than adding a second copy alongside them. See [Updating and re-indexing](#updating-and-re-indexing).
+
+To force a re-index without editing anything, reset the processed flags first:
 ```
-uv run scripts/reset_paper_processed.py
+uv run scripts/reset_processed.py            # papers and documents
+uv run scripts/reset_processed.py --docs     # documents only
 ```
 
 #### Why acquisition is manual

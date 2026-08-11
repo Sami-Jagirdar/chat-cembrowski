@@ -45,8 +45,10 @@ uv run scripts/eval_routing.py --full               # + answers and citation int
 uv run -m chat_cembrowski.data.vectordb --collection BAPa-V1 \
     --paper-id <id> --first-sheet 1 --last-sheet 144 --exclude-units 144R
 
-# Reset paper processed flags (before re-indexing)
-uv run scripts/reset_paper_processed.py
+# Reset processed flags (before re-indexing). Re-indexing replaces rather than
+# duplicates — see "Updating and re-indexing content" below.
+uv run scripts/reset_processed.py            # papers and documents
+uv run scripts/reset_processed.py --docs     # documents only
 
 # Run queries
 uv run scripts/ask.py             # Edit questions in the file first
@@ -217,6 +219,23 @@ Scanned pages produce the same payload as born-digital page chunks — `chunk_ca
 `image_type="page"` — so they retrieve and cite through the existing paths with no special
 casing. Point IDs are `uuid5` over `{paper_id}:scan:{sheet}{half}`, so re-running after
 adjusting the range or exclusions overwrites in place rather than duplicating.
+
+### Updating and re-indexing content
+
+Papers are published artifacts and effectively immutable, but **documents in `data/docs/` are expected to be edited in place**, and the original design could not express that: `doc_ingestion` skipped by filename, `vectordb` skipped on `processed`, and chunk IDs were `uuid4()`. An edit was silently ignored; forcing it through by deleting the JSON produced a *second* copy in Qdrant under a fresh `uuid7` doc ID, leaving both versions retrievable with no way to tell which was current — worse than the edit not applying, since the model would be handed contradictory context.
+
+Re-indexing is now a true replacement, resting on two halves that are only correct together:
+
+1. **Deterministic IDs.** `chunker` derives chunk IDs via `uuid5` over `{source_id}:{kind}:{index}` (`TEXT_ID_NAMESPACE`, `DOC_ID_NAMESPACE`, alongside the existing `PAGE_ID_NAMESPACE`), so re-upserting overwrites in place. `doc_ingestion.doc_id_for()` derives the Document ID by `uuid5` over the **filename**, so an edited file maps back to the same record rather than being registered as a new one.
+2. **`vectordb.delete_points_for(key, value)`.** Deterministic IDs update a chunk but cannot remove one: shorten a source from 10 chunks to 7 and points 7-9 survive with stale text. Every source is cleared by payload filter (`paper_id` / `doc_id`) immediately before re-upserting.
+
+**Ordering is delete → upsert → set `processed = True`.** A crash at any point leaves `processed` False, so the next run redoes the whole record instead of leaving it half-indexed. Do not reorder this.
+
+Edits are detected by `Document.content_hash` (sha256 of the *extracted* text, not the raw bytes — a `.docx` re-saved with no content change rewrites its zip container and would otherwise force a pointless re-embed). `doc_ingestion` compares the hash, and on a mismatch updates the text in place and clears `processed`. A Document with no stored hash (predating this) is re-ingested once to backfill it.
+
+`ensure_collection` indexes `paper_id` and `doc_id` as well as `authors`, since the filtered deletes need them.
+
+**Consequence worth knowing: re-indexing a poster drops its website links.** `link_posters.py` writes `site_path`/`poster_id` via `set_payload` *after* ingestion, so a delete-and-re-upsert clears them and the only symptom is a citation quietly rendering unlinked. `delete_points_for` counts the affected points first and logs a warning naming the re-run command. Re-run `scripts/link_posters.py --apply` after any poster re-ingestion.
 
 ### Linking poster chunks to the website (`scripts/link_posters.py`)
 
