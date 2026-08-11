@@ -40,6 +40,7 @@ wheels/
 *.jpeg
 data/vectors/collection/
 data/vectors/.lock
+data/catalog.csv
 
 # Keep only the placeholder in data/docs
 data/docs/*

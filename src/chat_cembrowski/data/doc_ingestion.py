@@ -5,6 +5,7 @@ Scans data/docs/ and creates Document objects with structured extracted text.
 Run with: uv run -m chat_cembrowski.data.doc_ingestion
 """
 
+import hashlib
 import logging
 import uuid
 from pathlib import Path
@@ -18,6 +19,11 @@ logger = logging.getLogger(__name__)
 DOCS_DIR = Path(__file__).resolve().parents[3] / "data" / "docs"
 DOC_JSON_DIR = Path(__file__).resolve().parents[3] / "data" / "doc_json"
 
+# Fixed namespace for deriving a stable Document ID from its filename, so an
+# edited file maps back to the same record (and therefore the same chunk IDs)
+# instead of being re-registered as a new document with orphaned old chunks.
+DOC_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "chat_cembrowski.documents")
+
 TEXT_EXTENSIONS = {".txt", ".md"}
 DOCX_EXTENSIONS = {".docx"}
 CODE_EXTENSIONS = {
@@ -27,6 +33,22 @@ CODE_EXTENSIONS = {
     ".sql", ".yaml", ".yml", ".toml", ".ini", ".cfg",
 }
 SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | DOCX_EXTENSIONS | CODE_EXTENSIONS
+
+
+def doc_id_for(source_file: str) -> str:
+    """Stable Document ID derived from the filename."""
+    return str(uuid.uuid5(DOC_ID_NAMESPACE, source_file))
+
+
+def content_hash(text: str) -> str:
+    """
+    sha256 of a document's extracted text.
+
+    Hashing the *extracted* text rather than the raw bytes means a .docx
+    re-saved with no content change (which rewrites its zip container and
+    changes the file bytes) does not trigger a pointless re-embed.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _extract_txt(file_path: Path) -> str:
@@ -114,9 +136,10 @@ def ingest_local_docs(
     docs_dir.mkdir(parents=True, exist_ok=True)
     doc_json_dir.mkdir(parents=True, exist_ok=True)
 
-    known_source_files = {d.source_file for d in load_documents_from_json(doc_json_dir)}
+    existing = {d.source_file: d for d in load_documents_from_json(doc_json_dir)}
 
     new_docs: list[Document] = []
+    updated_docs: list[Document] = []
 
     for file_path in sorted(docs_dir.iterdir()):
         if not file_path.is_file():
@@ -124,11 +147,7 @@ def ingest_local_docs(
         if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             logger.debug(f"Skipping unsupported file: {file_path.name}")
             continue
-        if file_path.name in known_source_files:
-            logger.info(f"Already registered, skipping: {file_path.name}")
-            continue
 
-        logger.info(f"Ingesting: {file_path.name}")
         ext = file_path.suffix.lower()
 
         try:
@@ -145,20 +164,45 @@ def ingest_local_docs(
             logger.error(f"Failed to extract text from {file_path.name}: {e}")
             continue
 
+        digest = content_hash(text)
+        prior = existing.get(file_path.name)
+
+        if prior is not None:
+            if prior.content_hash == digest:
+                logger.info(f"Unchanged, skipping: {file_path.name}")
+                continue
+
+            # Edited in place. Keep the ID (so chunk IDs stay stable) and clear
+            # processed so vectordb re-indexes: it deletes this doc_id's points
+            # before upserting, which also clears chunks an edit removed.
+            reason = "content changed" if prior.content_hash else "no stored hash"
+            logger.info(f"Re-ingesting '{file_path.name}' ({reason}).")
+            prior.text = text
+            prior.file_type = file_type
+            prior.title = file_path.stem
+            prior.content_hash = digest
+            prior.processed = False
+            save_document(prior, doc_json_dir)
+            updated_docs.append(prior)
+            continue
+
         doc = Document(
-            id=str(uuid.uuid7()),
+            id=doc_id_for(file_path.name),
             title=file_path.stem,
             source_file=file_path.name,
             file_type=file_type,
             text=text,
+            content_hash=digest,
             processed=False,
         )
         save_document(doc, doc_json_dir)
         new_docs.append(doc)
         logger.info(f"Created Document: '{doc.title}' ({doc.file_type}, {len(doc.text):,} chars)")
 
-    logger.info(f"Document ingestion complete. New documents: {len(new_docs)}")
-    return new_docs
+    logger.info(
+        f"Document ingestion complete. New: {len(new_docs)}, updated: {len(updated_docs)}."
+    )
+    return new_docs + updated_docs
 
 
 if __name__ == "__main__":

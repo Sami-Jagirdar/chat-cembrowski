@@ -15,7 +15,17 @@ import PIL.Image
 import voyageai
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    IsEmptyCondition,
+    MatchValue,
+    PayloadField,
+    PayloadSchemaType,
+    PointStruct,
+    VectorParams,
+)
 
 from .chunker import Chunk
 
@@ -112,13 +122,87 @@ def ensure_collection(
 
     # retrieval.authors filters on this field (Qdrant scroll with a payload
     # filter) to answer "who is X" questions — that filter 400s without an
-    # explicit index. Called unconditionally (not just on fresh collections)
-    # since it's idempotent and existing collections predate this field.
-    client.create_payload_index(
-        collection_name=collection_name,
-        field_name="authors",
-        field_schema=PayloadSchemaType.KEYWORD,
-    )
+    # explicit index. paper_id and doc_id back delete_points_for(), which
+    # re-indexing runs on every source before upserting. Called unconditionally
+    # (not just on fresh collections) since it's idempotent and existing
+    # collections predate these fields.
+    for field in ("authors", "paper_id", "doc_id"):
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name=field,
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+
+
+def delete_points_for(
+    client: QdrantClient,
+    key: str,
+    value: str,
+    collection_name: str = COLLECTION_NAME,
+) -> int:
+    """
+    Delete every point belonging to one source, before it is re-indexed.
+
+    Deterministic chunk IDs make a re-upsert overwrite matching points, but
+    they cannot remove points an edit no longer produces: shorten a source
+    from 10 chunks to 7 and points 7-9 survive, still retrievable, still
+    carrying stale text. Clearing by payload filter first is what makes
+    re-indexing a true replacement.
+
+    Returns the number of points that existed before deletion (0 when the
+    source is new), which the caller uses to warn about clobbered link
+    metadata.
+
+    Args:
+        client:          Active QdrantClient.
+        key:             Payload field identifying the source ("paper_id"/"doc_id").
+        value:           That field's value.
+        collection_name: Qdrant collection to delete from.
+    """
+    condition = Filter(must=[FieldCondition(key=key, match=MatchValue(value=value))])
+
+    try:
+        existing = client.count(
+            collection_name=collection_name, count_filter=condition, exact=True
+        ).count
+    except Exception as e:
+        logger.warning(f"Could not count existing points for {key}={value}: {e}")
+        existing = 0
+
+    if not existing:
+        return 0
+
+    # link_posters.py writes site_path/poster_id onto poster chunks *after*
+    # ingestion via set_payload. Re-indexing drops them, and the only symptom
+    # is a citation quietly losing its link, so say so loudly.
+    linked = 0
+    try:
+        linked = client.count(
+            collection_name=collection_name,
+            count_filter=Filter(
+                must=[FieldCondition(key=key, match=MatchValue(value=value))],
+                must_not=[IsEmptyCondition(is_empty=PayloadField(key="site_path"))],
+            ),
+            exact=True,
+        ).count
+    except Exception as e:
+        logger.debug(f"Could not count linked points for {key}={value}: {e}")
+
+    try:
+        client.delete(collection_name=collection_name, points_selector=condition)
+        logger.info(f"Deleted {existing} existing point(s) for {key}={value} before re-index.")
+    except Exception as e:
+        logger.error(f"Failed to delete existing points for {key}={value}: {e}")
+        return 0
+
+    if linked:
+        logger.warning(
+            f"{linked} of those point(s) carried website link metadata "
+            "(site_path/poster_id). Re-run 'uv run scripts/link_posters.py --apply' "
+            "after this ingestion or their citations will render unlinked."
+        )
+
+    return existing
 
 
 def _batched(iterable, n: int) -> Iterator[list]:
@@ -421,6 +505,12 @@ if __name__ == "__main__":
                 chunks = chunk_paper(paper) + chunk_paper_images(paper)
                 upsert_kwargs = dict(images_dir=IMAGES_DIR)
 
+            # Replace, don't accumulate. Ordering is deliberate: delete →
+            # upsert → mark processed. A crash anywhere leaves processed False,
+            # so the next run redoes the whole record rather than leaving it
+            # half-indexed.
+            delete_points_for(client, "paper_id", paper.id, collection_name=collection_name)
+
             if embed_and_upsert(client, vo, chunks, collection_name=collection_name, **upsert_kwargs) > 0:
                 logger.info(
                     f"Embedded and upserted chunks for paper "
@@ -438,6 +528,8 @@ if __name__ == "__main__":
                 continue
 
             chunks = chunk_document(doc)
+
+            delete_points_for(client, "doc_id", doc.id, collection_name=collection_name)
 
             if embed_and_upsert(client, vo, chunks, collection_name=collection_name) > 0:
                 logger.info(f"Embedded and upserted chunks for document '{doc.title}'.")

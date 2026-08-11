@@ -180,6 +180,7 @@ def load_document(json_file: str | Path) -> Optional[Document]:
             source_file=data["source_file"],
             file_type=data["file_type"],
             text=data.get("text", ""),
+            content_hash=data.get("content_hash"),
             processed=data.get("processed", False),
         )
     except Exception as e:
