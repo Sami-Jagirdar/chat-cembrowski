@@ -25,6 +25,29 @@ DEFAULT_PAGE_RENDER_ZOOM = 2.0  # ~144 DPI (72 * zoom); higher = sharper text, m
 MAX_PAGE_IMAGE_PIXELS = 16_000_000
 PAGE_IMAGE_PIXEL_SAFETY_MARGIN = 0.95  # stay safely under the cap after integer pixel rounding
 
+def _to_markdown_forcing_invisible_text(pdf_path: Path, **kwargs):
+    """pymupdf4llm.to_markdown(), but temporarily forced onto the classic
+    (non-layout) engine with ignore_alpha=True so invisible text is accepted
+    unconditionally.
+
+    Used as a fallback for PDFs where a page mixes an invisible OCR text
+    layer (common for ABBYY-scanned sources: render mode 3, "ignore-text")
+    with a small amount of normal visible text, e.g. running headers. Both
+    pymupdf4llm's default layout engine and the classic engine's
+    page_is_ocr() heuristic only accept invisible text when a page is
+    *purely* invisible text, so on a mixed page the OCR content — the
+    actual body of the document — is silently dropped, even though
+    has_text_layer() sees the layer and skips the scanned-PDF OCR fallback.
+    Forcing the classic engine with ignore_alpha=True bypasses that
+    heuristic and recovers the text.
+    """
+    pymupdf4llm.use_layout(False)
+    try:
+        return pymupdf4llm.to_markdown(str(pdf_path), ignore_alpha=True, **kwargs)
+    finally:
+        pymupdf4llm.use_layout(True)
+
+
 def _parse_pdf_for_text(pdf_path: Path) -> str | List[Dict[str, Any]]:
     """
      Parse a single PDF file and extract text as markdown.
@@ -40,8 +63,14 @@ def _parse_pdf_for_text(pdf_path: Path) -> str | List[Dict[str, Any]]:
         if not pdf_path.exists():
             logger.error(f"PDF file not found: {pdf_path}")
             return ""
-        
+
         text = pymupdf4llm.to_markdown(str(pdf_path))
+        if not text:
+            logger.warning(
+                f"No text extracted from {pdf_path} via the default pymupdf4llm "
+                f"path; retrying with invisible text forced on."
+            )
+            text = _to_markdown_forcing_invisible_text(pdf_path)
         if not text:
             logger.warning(f"No text extracted from {pdf_path}")
             return ""
@@ -49,6 +78,19 @@ def _parse_pdf_for_text(pdf_path: Path) -> str | List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error parsing {pdf_path}: {e}")
         return ""
+
+
+def _page_chunks_to_pages(page_chunks) -> list[dict]:
+    pages = []
+    for page_data in page_chunks:
+        if not isinstance(page_data, dict):
+            continue
+        text = page_data.get("text", "")
+        page_number = page_data.get("metadata", {}).get("page_number", 0)
+        if text.strip():
+            pages.append({"text": text, "page": page_number})
+    return pages
+
 
 def parse_pdf_for_pages(pdf_path: Path) -> list[dict]:
     """
@@ -68,18 +110,19 @@ def parse_pdf_for_pages(pdf_path: Path) -> list[dict]:
             return []
 
         page_chunks = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
-        if not page_chunks:
-            logger.warning(f"No text extracted from {pdf_path}")
-            return []
+        pages = _page_chunks_to_pages(page_chunks) if page_chunks else []
 
-        pages = []
-        for page_data in page_chunks:
-            if not isinstance(page_data, dict):
-                continue
-            text = page_data.get("text", "")
-            page_number = page_data.get("metadata", {}).get("page_number", 0)
-            if text.strip():
-                pages.append({"text": text, "page": page_number})
+        if not pages:
+            logger.warning(
+                f"No text extracted from {pdf_path} via the default pymupdf4llm "
+                f"path; retrying with invisible text forced on (handles mixed "
+                f"invisible/visible OCR text layers)."
+            )
+            page_chunks = _to_markdown_forcing_invisible_text(pdf_path, page_chunks=True)
+            pages = _page_chunks_to_pages(page_chunks) if page_chunks else []
+
+        if not pages:
+            logger.warning(f"No text extracted from {pdf_path}")
 
         return pages
 
